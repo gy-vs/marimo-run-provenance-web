@@ -1,0 +1,438 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+/* oxlint-disable typescript/no-explicit-any */
+
+import { getWorkerRPC } from "@/core/wasm/rpc";
+import { Deferred } from "@/utils/Deferred";
+import { throwNotImplemented } from "@/utils/functions";
+import { Logger } from "@/utils/Logger";
+import { generateUUID } from "@/utils/uuid";
+import { initialNotebookState, notebookAtom } from "../cells/cells";
+import type { CommandMessage } from "../kernel/messages";
+import type { EditRequests, RunRequests } from "../network/types";
+import { store as defaultStore } from "../state/jotai";
+import { getMarimoExportContext } from "../static/export-context";
+import { createMarimoFile, parseMarimoIslandApps } from "./parse";
+import { islandsInitializedAtom, islandsPendingInitialRunsAtom } from "./state";
+import type { IslandsKernelMessage, WorkerSchema } from "./worker/worker";
+import type { WorkerFactory } from "./worker-factory";
+import { DefaultWorkerFactory } from "./worker-factory";
+
+/**
+ * Configuration for creating an IslandsPyodideBridge
+ */
+export interface IslandsBridgeConfig {
+  /**
+   * Optional worker factory for creating workers (for testing)
+   */
+  workerFactory?: WorkerFactory;
+
+  /**
+   * Optional Jotai store (for testing)
+   */
+  store?: typeof defaultStore;
+
+  /**
+   * Optional root element for parsing islands (for testing)
+   */
+  root?: Document | Element;
+}
+
+interface AppSession {
+  appId: string;
+  code?: string;
+  sessionGeneration: number;
+}
+
+/**
+ * Bridge between the browser and Pyodide worker for islands mode.
+ *
+ * This class manages communication with a Web Worker that runs Python code
+ * via Pyodide, enabling interactive marimo islands.
+ *
+ * @example
+ * ```ts
+ * const bridge = new IslandsPyodideBridge();
+ * bridge.consumeMessages(message => console.log(message));
+ * await bridge.initializeApps();
+ * ```
+ */
+export class IslandsPyodideBridge implements RunRequests, EditRequests {
+  private rpc: ReturnType<typeof getWorkerRPC<WorkerSchema>>;
+  private messageConsumer:
+    | ((message: IslandsKernelMessage) => void)
+    | undefined;
+  private readonly store: typeof defaultStore;
+  private readonly root: Document | Element;
+  private session: AppSession | undefined;
+  private sessionReady = new Deferred<AppSession>();
+  private nextSessionGeneration = 0;
+  private readonly activeSessionGenerations = new Set<number>();
+  private appTransition = Promise.resolve();
+  private workerReady = new Deferred<void>();
+
+  public initialized = new Deferred<void>();
+
+  constructor(config: IslandsBridgeConfig = {}) {
+    this.store = config.store || defaultStore;
+    this.root = config.root || document;
+
+    try {
+      const factory = config.workerFactory || new DefaultWorkerFactory();
+      const worker = factory.create();
+      this.rpc = getWorkerRPC<WorkerSchema>(worker);
+      this.setupMessageListeners();
+    } catch (error) {
+      Logger.error("Failed to initialize IslandsPyodideBridge:", error);
+      this.initialized.reject(error);
+      throw error;
+    }
+  }
+
+  /**
+   * Sets up message listeners for worker communication
+   */
+  private setupMessageListeners(): void {
+    this.rpc.addMessageListener("ready", () => {
+      this.workerReady.resolve();
+    });
+
+    this.rpc.addMessageListener("initialized", () => {
+      this.store.set(islandsInitializedAtom, true);
+      this.initialized.resolve();
+    });
+
+    this.rpc.addMessageListener(
+      "initializedError",
+      ({ error }: { error: string }) => {
+        Logger.error("Islands initialization error:", error);
+        this.store.set(islandsInitializedAtom, error);
+        this.initialized.reject(new Error(error));
+      },
+    );
+
+    this.rpc.addMessageListener("kernelMessage", (message) => {
+      // A stopped session can still have messages in transit after the next
+      // app takes ownership of the shared frontend state.
+      if (!this.activeSessionGenerations.has(message.sessionGeneration)) {
+        return;
+      }
+      this.messageConsumer?.(message);
+    });
+  }
+
+  async initializeApps(): Promise<void> {
+    await this.enqueueAppTransition(async () => {
+      await this.workerReady.promise;
+      await this.startApps();
+    });
+  }
+
+  private async startApps(): Promise<void> {
+    const apps = parseMarimoIslandApps(this.root, { materialize: false });
+    const managesSingleApp = apps.length === 1;
+    Logger.debug(
+      `Starting sessions for ${apps.length} app(s):`,
+      apps.map((a) => `${a.id} (${a.cells.length} cells)`),
+    );
+    // Payload-backed apps already carry the exact runtime cells and order. The
+    // full-notebook export context may describe a different source and would
+    // override the payload contract for single-app pages.
+    const exportContext =
+      apps.length === 1 && !apps[0]?.payloadBacked
+        ? getMarimoExportContext()
+        : undefined;
+    const notebookCode = exportContext?.notebookCode;
+    const singleApp = managesSingleApp ? apps[0] : undefined;
+    const singleAppFile = singleApp
+      ? notebookCode || createMarimoFile(singleApp)
+      : undefined;
+    if (
+      singleApp &&
+      this.session?.appId === singleApp.id &&
+      this.session.code === singleAppFile
+    ) {
+      parseMarimoIslandApps(this.root);
+      return;
+    }
+    if (apps.length > 0) {
+      this.activeSessionGenerations.clear();
+      this.store.set(
+        islandsPendingInitialRunsAtom,
+        new Set(apps.map((_, index) => this.nextSessionGeneration + index + 1)),
+      );
+    }
+    parseMarimoIslandApps(this.root);
+    for (const app of apps) {
+      const file = singleAppFile || createMarimoFile(app);
+      Logger.debug(`App ${app.id} marimo file:\n`, file);
+      const request = {
+        code: file,
+        appId: app.id,
+        sessionGeneration: ++this.nextSessionGeneration,
+      };
+      const previousSession = this.session;
+      const replacesSession = managesSingleApp && previousSession !== undefined;
+      this.activeSessionGenerations.add(request.sessionGeneration);
+      if (replacesSession) {
+        this.store.set(notebookAtom, initialNotebookState());
+      }
+      if (managesSingleApp || !previousSession) {
+        if (managesSingleApp && this.sessionReady.status !== "pending") {
+          this.sessionReady = new Deferred<AppSession>();
+        }
+        this.session = {
+          ...request,
+          code: managesSingleApp ? file : undefined,
+        };
+      }
+      const operation = replacesSession
+        ? this.rpc.proxy.request.replaceSession(request)
+        : this.startSession(request);
+      try {
+        await operation;
+        if (this.sessionReady.status === "pending" && this.session) {
+          this.sessionReady.resolve(this.session);
+        }
+      } catch (error) {
+        this.activeSessionGenerations.delete(request.sessionGeneration);
+        if (this.session?.sessionGeneration === request.sessionGeneration) {
+          this.session = previousSession;
+          if (previousSession) {
+            this.activeSessionGenerations.add(
+              previousSession.sessionGeneration,
+            );
+          }
+        }
+        Logger.error(`Failed to start session for app ${app.id}:`, error);
+        if (managesSingleApp) {
+          throw error;
+        }
+      }
+    }
+  }
+
+  async stopSession(appId?: string): Promise<void> {
+    await this.enqueueAppTransition(async () => {
+      const session = this.session;
+      if (session?.code === undefined || (appId && session.appId !== appId)) {
+        return;
+      }
+      this.activeSessionGenerations.delete(session.sessionGeneration);
+      await this.rpc.proxy.request.stopSession({
+        appId: session.appId,
+        sessionGeneration: session.sessionGeneration,
+      });
+      this.store.set(islandsPendingInitialRunsAtom, null);
+      this.session = undefined;
+      this.sessionReady = new Deferred<AppSession>();
+      this.store.set(notebookAtom, initialNotebookState());
+    });
+  }
+
+  private enqueueAppTransition(operation: () => Promise<void>): Promise<void> {
+    const result = this.appTransition.then(operation);
+    this.appTransition = result.catch(() => undefined);
+    return result;
+  }
+
+  /**
+   * Starts a new Python session for an app
+   */
+  async startSession(opts: {
+    code: string;
+    appId: string;
+    sessionGeneration: number;
+  }): Promise<void> {
+    await this.rpc.proxy.request.startSession(opts);
+  }
+
+  /**
+   * Sets up a consumer for kernel messages
+   */
+  consumeMessages(consumer: (message: IslandsKernelMessage) => void): void {
+    this.messageConsumer = consumer;
+    this.rpc.proxy.send.consumerReady({});
+  }
+
+  // ============================================================================
+  // RunRequests Implementation
+  // ============================================================================
+
+  sendComponentValues: RunRequests["sendComponentValues"] = async (
+    request,
+  ): Promise<null> => {
+    await this.putControlRequest({
+      type: "update-ui-element",
+      ...request,
+      token: generateUUID(),
+    });
+    return null;
+  };
+
+  sendInstantiate: RunRequests["sendInstantiate"] = async (): Promise<null> => {
+    return null;
+  };
+
+  sendFunctionRequest: RunRequests["sendFunctionRequest"] = async (
+    request,
+  ): Promise<null> => {
+    await this.putControlRequest({
+      type: "invoke-function",
+      ...request,
+    });
+    return null;
+  };
+
+  sendModelValue: RunRequests["sendModelValue"] = async (request) => {
+    await this.putControlRequest({
+      type: "model",
+      ...request,
+    });
+    return null;
+  };
+
+  // ============================================================================
+  // EditRequests Implementation
+  // ============================================================================
+
+  sendRun: EditRequests["sendRun"] = async (request): Promise<null> => {
+    const session = await this.getActiveSession();
+    await this.rpc.proxy.request.loadPackages({
+      appId: session.appId,
+      code: request.codes.join("\n"),
+      sessionGeneration: session.sessionGeneration,
+    });
+    await this.putControlRequest(
+      {
+        type: "execute-cells",
+        ...request,
+      },
+      session,
+    );
+    return null;
+  };
+
+  // ============================================================================
+  // Not Implemented (Read-Only Mode)
+  // ============================================================================
+
+  getUsageStats = throwNotImplemented;
+  getEnvironmentInfo = throwNotImplemented;
+  sendRename = throwNotImplemented;
+  sendSave = throwNotImplemented;
+  sendCopy = throwNotImplemented;
+  sendRunScratchpad = throwNotImplemented;
+  sendStdin = throwNotImplemented;
+  sendInterrupt = throwNotImplemented;
+  sendShutdown = throwNotImplemented;
+  sendFormat = throwNotImplemented;
+  sendDeleteCell = throwNotImplemented;
+  sendInstallMissingPackages = throwNotImplemented;
+  sendCodeCompletionRequest = throwNotImplemented;
+  saveUserConfig = throwNotImplemented;
+  saveAppConfig = throwNotImplemented;
+  saveCellConfig = throwNotImplemented;
+  sendRestart = throwNotImplemented;
+  sendDocumentTransaction = throwNotImplemented;
+  readCode = throwNotImplemented;
+  readSnippets = throwNotImplemented;
+  previewDatasetColumn = throwNotImplemented;
+  previewSQLTable = throwNotImplemented;
+  previewSQLTableList = throwNotImplemented;
+  previewSQLSchemaList = throwNotImplemented;
+  previewDataSourceConnection = throwNotImplemented;
+  discoverDataSources = throwNotImplemented;
+  validateSQL = throwNotImplemented;
+  openFile = throwNotImplemented;
+  getFileRoots = throwNotImplemented;
+  sendListFiles = throwNotImplemented;
+  sendSearchFiles = throwNotImplemented;
+  sendPdb = throwNotImplemented;
+  sendSetBreakpoints = throwNotImplemented;
+  sendCreateFileOrFolder = throwNotImplemented;
+  sendDeleteFileOrFolder = throwNotImplemented;
+  sendCopyFileOrFolder = throwNotImplemented;
+  sendRenameFileOrFolder = throwNotImplemented;
+  sendUpdateFile = throwNotImplemented;
+  sendFileDetails = throwNotImplemented;
+  openTutorial = throwNotImplemented;
+  getExportAvailability = throwNotImplemented;
+  installExportRequirements = throwNotImplemented;
+  exportAsHTML = throwNotImplemented;
+  exportAsIPYNB = throwNotImplemented;
+  exportAsMarkdown = throwNotImplemented;
+  exportAsScript = throwNotImplemented;
+  exportAsPDF = throwNotImplemented;
+  autoExportAsHTML = throwNotImplemented;
+  autoExportAsMarkdown = throwNotImplemented;
+  autoExportAsIPYNB = throwNotImplemented;
+  updateCellOutputs = throwNotImplemented;
+  addPackage = throwNotImplemented;
+  removePackage = throwNotImplemented;
+  getPackageList = throwNotImplemented;
+  getSandbox = throwNotImplemented;
+  updateManifest = throwNotImplemented;
+  syncSandbox = throwNotImplemented;
+  getDependencyTree = throwNotImplemented;
+  getRecentFiles = throwNotImplemented;
+  getWorkspaceFiles = throwNotImplemented;
+  getRunningNotebooks = throwNotImplemented;
+  shutdownSession = throwNotImplemented;
+  listSecretKeys = throwNotImplemented;
+  writeSecret = throwNotImplemented;
+  invokeAiTool = throwNotImplemented;
+  clearCache = throwNotImplemented;
+  getCacheInfo = throwNotImplemented;
+  listStorageEntries = throwNotImplemented;
+  downloadStorage = throwNotImplemented;
+
+  // The kernel uses msgspec to parse control requests, which requires a 'type'
+  // field for discriminated union deserialization.
+  private async putControlRequest(
+    operation: CommandMessage,
+    session?: AppSession,
+  ): Promise<void> {
+    session ??= await this.getActiveSession();
+    await this.rpc.proxy.request.bridge({
+      appId: session.appId,
+      functionName: "put_control_request",
+      payload: operation,
+      sessionGeneration: session.sessionGeneration,
+    });
+  }
+
+  private async getActiveSession(): Promise<AppSession> {
+    const transition = this.appTransition;
+    const session = this.session;
+    const ready = this.sessionReady;
+    await transition;
+    return session ?? ready.promise;
+  }
+
+  /**
+   * Cleans up resources (for testing)
+   */
+  destroy(): void {
+    // Future: terminate worker if we own it
+  }
+}
+
+/**
+ * Global singleton instance.
+ * Use `new IslandsPyodideBridge(config)` in tests for better isolation.
+ */
+let globalBridgeInstance: IslandsPyodideBridge | null = null;
+
+export function getGlobalBridge(): IslandsPyodideBridge {
+  if (!globalBridgeInstance) {
+    globalBridgeInstance = new IslandsPyodideBridge();
+  }
+  return globalBridgeInstance;
+}
+
+/**
+ * Resets the global bridge instance (for testing)
+ */
+export function resetGlobalBridge(): void {
+  globalBridgeInstance = null;
+}

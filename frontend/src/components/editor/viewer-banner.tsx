@@ -1,0 +1,87 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+import { useAtomValue } from "jotai/react";
+import { ArrowRightSquareIcon, EyeIcon } from "lucide-react";
+import { KnownQueryParams } from "@/core/constants";
+import { useLayoutState } from "@/core/layout/state";
+import { kioskModeAtom, viewStateAtom } from "@/core/mode";
+import { API } from "@/core/network/api";
+import { Banner } from "@/plugins/impl/common/error-banner";
+import { prettyError } from "@/utils/errors";
+import { Button } from "../ui/button";
+import { Tooltip } from "../ui/tooltip";
+import { toast } from "../ui/use-toast";
+
+export const ViewerBanner = () => {
+  const isViewing = useAtomValue(kioskModeAtom);
+  const { selectedLayout } = useLayoutState();
+  const { mode } = useAtomValue(viewStateAtom);
+
+  // Only a demoted editor (a second tab auto-routed to read-only) is offered
+  // takeover. A client that explicitly requested kiosk (?kiosk=true: embeds,
+  // slide previews, dashboards) is an intentional viewer and gets no banner.
+  const isIntentionalKiosk = new URL(window.location.href).searchParams.has(
+    KnownQueryParams.kiosk,
+  );
+
+  // Takeover is an editing affordance: only surface it in the default vertical
+  // reading view. Grid/slides layouts and present mode are app-style views
+  // where a floating take-over banner is out of place.
+  if (
+    !isViewing ||
+    isIntentionalKiosk ||
+    selectedLayout !== "vertical" ||
+    mode === "present"
+  ) {
+    return null;
+  }
+
+  const handleTakeover = async () => {
+    try {
+      const searchParams = new URL(window.location.href).searchParams;
+      // No reload: the server replies with consumer-capabilities
+      // (edit: true), which flips kiosk mode off and hides this banner.
+      await API.post(`/kernel/takeover?${searchParams.toString()}`, {});
+    } catch (error) {
+      toast({
+        title: "Failed to take over session",
+        description: prettyError(error),
+        variant: "danger",
+      });
+    }
+  };
+
+  // A zero-height sticky row pins the banner to the top-left of the notebook
+  // scroll area, so it stays visible while scrolling without reserving space in
+  // the flow. Because it reserves no space, the banner visually overlaps the
+  // app header (sticky at z-50); setting the banner to z-100 keeps the header
+  // from covering the button and swallowing its clicks.
+  return (
+    <div className="sticky top-2 left-2 z-100 h-0 ml-2 w-fit print:hidden">
+      <Banner
+        kind="info"
+        className="flex items-center gap-2 rounded px-2 py-1 text-xs shadow-sm"
+      >
+        <span className="flex items-center gap-1 text-muted-foreground">
+          <EyeIcon className="w-3.5 h-3.5 shrink-0" />
+          You are currently connected as a reader.
+        </span>
+        <Tooltip
+          content="Switch editing to this tab. The current editor becomes read-only."
+          side="bottom"
+        >
+          <Button
+            onClick={handleTakeover}
+            variant="outline"
+            size="xs"
+            data-testid="takeover-button"
+            className="shrink-0"
+          >
+            <ArrowRightSquareIcon className="w-3 h-3 mr-1" />
+            Take over
+          </Button>
+        </Tooltip>
+      </Banner>
+    </div>
+  );
+};

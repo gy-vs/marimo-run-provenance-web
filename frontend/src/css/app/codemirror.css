@@ -1,0 +1,172 @@
+@reference "../globals.css";
+
+.light .cm-selectionBackground {
+  /* Keep drawn selections visible when focus moves to find/replace or another editor. */
+  background-color: var(
+    --cm-selection-background,
+    var(--cm-selection-background-light)
+  ) !important;
+}
+
+.dark .cm-selectionBackground {
+  background-color: var(
+    --cm-selection-background,
+    var(--cm-selection-background-dark)
+  ) !important;
+}
+
+.cm-focused.cm-focused {
+  outline: none;
+}
+
+/* -- Gutters -- */
+
+.cm .cm-gutters {
+  @apply bg-background;
+
+  /* Style line numbers. */
+  font-size: 0.75rem;
+  color: var(--gray-10);
+}
+
+.dark .cm .cm-gutters {
+  background-color: transparent;
+}
+
+.marimo-cell .cm-scroller {
+  /* this needs to be visible to show RTC cursors and inline AI edit buttons */
+  overflow: visible;
+}
+
+/* -- Tooltips: code completion and type hints -- */
+
+#root .cm-tooltip {
+  border-radius: 4px;
+  z-index: 1000;
+
+  @apply bg-popover shadow-sm shadow-shade border-border;
+}
+
+/*
+ First selector is when there is a tooltip by hover
+ Second selector is when there is tooltip by cursor
+ Third selector is during code completion */
+#root .cm-tooltip.cm-tooltip-hover,
+#root .cm-tooltip.mo-cm-tooltip,
+#root .cm-tooltip.cm-completionInfo {
+  max-height: 45vh; /* 45% of viewport height */
+  max-width: 40vw; /* 40% of viewport width */
+  overflow: auto;
+  scrollbar-width: thin;
+
+  /* Respect newlines. */
+  border-radius: 4px;
+}
+
+/* Hover tooltips get highest priority in display. */
+#root .cm-tooltip.cm-tooltip-hover {
+  z-index: 1000;
+}
+
+/* -- Panels -- */
+
+.cm .cm-panels {
+  background-color: var(--cm-background);
+  color: var(--sky-11);
+  font-weight: 700;
+
+  /* room for buttons */
+  margin-right: 30px;
+
+  @apply text-xs;
+
+  &.cm-panels-bottom {
+    border-top: 1px solid var(--border);
+  }
+}
+
+/* -- Linting -- */
+
+.cm-tooltip-lint {
+  @apply text-sm;
+
+  code {
+    @apply bg-muted border border-border rounded-md px-1;
+  }
+
+  /* The message, the docs link, and related info are siblings; stack them. */
+  .cm-lsp-diagnostic-message {
+    @apply flex flex-col items-start gap-1;
+
+    /* Rendered markdown, so the `pre-wrap` on `.cm-diagnostic` would only turn
+       the whitespace between block tags into blank lines. */
+    white-space: normal;
+  }
+
+  .cm-diagnostic-code-link {
+    @apply text-xs;
+  }
+
+  /* The docs link already reads `source(code)`; don't repeat it below. */
+  .cm-diagnostic:has(.cm-diagnostic-code-link) .cm-diagnosticSource {
+    @apply hidden;
+  }
+}
+
+/* -- Ghost Text -- */
+
+.cm-ghostText,
+.cm-ghostText * {
+  opacity: 0.6;
+  filter: grayscale(20%);
+  cursor: pointer;
+}
+
+.cm-ghostText:hover {
+  background: var(--gray-3);
+}
+
+/* -- Codeium -- */
+
+.cm-codeium-cycle {
+  font-size: 0.5625rem;
+  background-color: var(--sky-3);
+  padding: 2px;
+  border-radius: 2px;
+  display: inline-block;
+}
+
+.cm-codeium-cycle-key {
+  font-size: 0.5625rem;
+  font-family: monospace;
+  display: inline-block;
+  padding: 2px;
+  border-radius: 2px;
+  border: none;
+  background-color: var(--sky-7);
+  margin-left: 5px;
+}
+
+.cm-codeium-cycle-key:hover {
+  background-color: var(--sky-9);
+}
+
+.cm-codeium-cycle-explanation {
+  font-family: monospace;
+  display: inline-block;
+  padding: 2px;
+}
+
+/* Rename symbol popup (F2). The upstream popup hardcodes white inline styles;
+  override with theme tokens. */
+.cm-rename-popup {
+  background: var(--popover) !important;
+  border-color: var(--border) !important;
+  color: var(--popover-foreground) !important;
+}
+
+.cm-rename-popup input {
+  background: var(--background) !important;
+  border-color: var(--border) !important;
+  color: var(--foreground) !important;
+}

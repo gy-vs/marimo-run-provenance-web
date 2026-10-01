@@ -1,0 +1,210 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+/* oxlint-disable typescript/no-explicit-any */
+
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import * as apiModule from "../api";
+import { visibleForTesting } from "../requests-lazy";
+import { createNetworkRequests } from "../requests-network";
+
+const { ACTIONS } = visibleForTesting;
+
+// Mock dependencies
+vi.mock("../../runtime/config", () => ({
+  getRuntimeManager: vi.fn(() => ({
+    sessionHeaders: vi.fn(() => ({ "X-Test-Header": "test" })),
+    isLazy: true,
+  })),
+}));
+
+vi.mock("../api", async () => {
+  const actual = await vi.importActual<typeof apiModule>("../api");
+  return {
+    ...actual,
+    API: {
+      handleExportResponse: vi.fn((response) => response.data),
+      handleResponse: vi.fn((response) => response.data),
+      handleResponseReturnNull: vi.fn(() => null),
+    },
+    createClientWithRuntimeManager: vi.fn(),
+  };
+});
+
+vi.mock("../connection", () => ({
+  isConnectedAtom: { read: vi.fn(() => true) },
+  waitForConnectionOpen: vi.fn().mockResolvedValue(undefined),
+  waitForConnectionOpenIfNotebook: vi.fn().mockResolvedValue(undefined),
+}));
+
+describe("createNetworkRequests", () => {
+  let mockClient: any;
+  let capturedCalls: Map<string, { hasParams: boolean; endpoint: string }>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    capturedCalls = new Map();
+
+    // Create mock client that captures all calls
+    const createMockMethod = (endpoint: string) => {
+      return vi.fn((_route: string, options?: any) => {
+        const hasParams = options?.params !== undefined;
+        capturedCalls.set(endpoint, { hasParams, endpoint });
+        return Promise.resolve({ data: null, error: undefined });
+      });
+    };
+
+    mockClient = {
+      POST: createMockMethod("POST"),
+      GET: createMockMethod("GET"),
+    };
+
+    // Mock createClientWithRuntimeManager to return our mock client
+    vi.mocked(apiModule.createClientWithRuntimeManager).mockReturnValue(
+      mockClient,
+    );
+  });
+
+  it("all request methods have an action defined", () => {
+    const requests = createNetworkRequests();
+    const methodNames = Object.keys(requests);
+
+    for (const methodName of methodNames) {
+      expect(
+        ACTIONS[methodName as keyof typeof ACTIONS],
+        `Method ${methodName} has no action defined`,
+      ).toBeDefined();
+    }
+  });
+
+  describe("special behavior", () => {
+    it("exportAsHTML should set assetUrl in dev/test mode", async () => {
+      const originalEnv = process.env.NODE_ENV;
+      process.env.NODE_ENV = "development";
+
+      const requests = createNetworkRequests();
+      await requests.exportAsHTML({} as any);
+
+      expect(mockClient.POST).toHaveBeenCalledWith(
+        "/api/export/html",
+        expect.objectContaining({
+          body: expect.objectContaining({
+            assetUrl: window.location.origin,
+          }),
+        }),
+      );
+
+      process.env.NODE_ENV = originalEnv;
+    });
+
+    it("exportAsPDF should pass preset through to the API", async () => {
+      const requests = createNetworkRequests();
+      await requests.exportAsPDF({
+        webpdf: false,
+        preset: "slides",
+        includeInputs: false,
+      } as any);
+
+      expect(mockClient.POST).toHaveBeenCalledWith(
+        "/api/export/pdf",
+        expect.objectContaining({
+          body: expect.objectContaining({
+            webpdf: false,
+            preset: "slides",
+            includeInputs: false,
+          }),
+          parseAs: "blob",
+        }),
+      );
+    });
+
+    it("exportAsScript should request a text export", async () => {
+      const requests = createNetworkRequests();
+      await requests.exportAsScript({ download: false });
+
+      expect(mockClient.POST).toHaveBeenCalledWith(
+        "/api/export/script",
+        expect.objectContaining({
+          body: { download: false },
+          parseAs: "text",
+        }),
+      );
+    });
+
+    it("getEnvironmentInfo should GET /api/environment", async () => {
+      const requests = createNetworkRequests();
+      await requests.getEnvironmentInfo();
+
+      expect(mockClient.GET).toHaveBeenCalledWith("/api/environment");
+    });
+
+    it("getFileRoots should GET /api/files/roots", async () => {
+      const requests = createNetworkRequests();
+      await requests.getFileRoots();
+
+      expect(mockClient.GET).toHaveBeenCalledWith("/api/files/roots");
+    });
+
+    it("getExportAvailability should GET /api/export/availability", async () => {
+      const requests = createNetworkRequests();
+      await requests.getExportAvailability();
+
+      expect(mockClient.GET).toHaveBeenCalledWith("/api/export/availability");
+    });
+
+    it("installExportRequirements should POST the export format", async () => {
+      const requests = createNetworkRequests();
+      await requests.installExportRequirements({ format: "pdf" });
+
+      expect(mockClient.POST).toHaveBeenCalledWith(
+        "/api/export/requirements/install",
+        expect.objectContaining({
+          body: { format: "pdf" },
+          params: expect.anything(),
+        }),
+      );
+    });
+
+    it("discoverDataSources should POST to the discovery endpoint", async () => {
+      const requests = createNetworkRequests();
+      const request = { requestId: "discovery-request" } as any;
+      await requests.discoverDataSources(request);
+
+      expect(mockClient.POST).toHaveBeenCalledWith(
+        "/api/datasources/discover",
+        expect.objectContaining({
+          body: request,
+          params: expect.anything(),
+        }),
+      );
+    });
+
+    it("getPackageList should not require a kernel connection", async () => {
+      const { waitForConnectionOpen, waitForConnectionOpenIfNotebook } =
+        await import("../connection");
+
+      const requests = createNetworkRequests();
+      await requests.getPackageList();
+
+      expect(mockClient.GET).toHaveBeenCalledWith("/api/packages/list");
+      expect(waitForConnectionOpenIfNotebook).toHaveBeenCalled();
+      expect(waitForConnectionOpen).not.toHaveBeenCalled();
+    });
+
+    it("exportAsIPYNB should call the new endpoint as text", async () => {
+      const requests = createNetworkRequests();
+      await requests.exportAsIPYNB({
+        download: false,
+      } as any);
+
+      expect(mockClient.POST).toHaveBeenCalledWith(
+        "/api/export/ipynb",
+        expect.objectContaining({
+          body: expect.objectContaining({
+            download: false,
+          }),
+          parseAs: "text",
+        }),
+      );
+    });
+  });
+});

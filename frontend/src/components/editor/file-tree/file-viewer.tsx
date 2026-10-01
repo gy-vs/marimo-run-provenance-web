@@ -1,0 +1,259 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+import { keymap } from "@codemirror/view";
+import { useAtomValue } from "jotai";
+import {
+  AlertTriangleIcon,
+  CopyIcon,
+  ExternalLinkIcon,
+  SaveIcon,
+} from "lucide-react";
+import type React from "react";
+import { useEffect, useRef, useState } from "react";
+import { renderShortcut } from "@/components/shortcuts/renderShortcut";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Button } from "@/components/ui/button";
+import { Tooltip } from "@/components/ui/tooltip";
+import { disableFileDownloadsAtom, hotkeysAtom } from "@/core/config/config";
+import { useRequestClient } from "@/core/network/requests";
+import type { FileInfo } from "@/core/network/types";
+import { filenameAtom } from "@/core/saving/file-state";
+import { isWasm } from "@/core/wasm/utils";
+import { useAsyncData } from "@/hooks/useAsyncData";
+import { ErrorBanner } from "@/plugins/impl/common/error-banner";
+import { copyToClipboard } from "@/utils/copy";
+import { downloadFile } from "./download";
+import { FilePreviewHeader } from "./file-header";
+import { FilePreviewMetadata } from "./file-preview-metadata";
+import { getFileRenderMode } from "./file-render-mode";
+import { buildMediaSource, FileContentRenderer } from "./renderers";
+
+export const MAX_FILE_PREVIEW_BYTES = 10 * 1024 * 1024;
+
+interface Props {
+  file: FileInfo;
+  onOpenNotebook?: (
+    evt: Pick<Event, "stopPropagation" | "preventDefault">,
+  ) => void;
+}
+
+const unsavedContentsForFile = new Map<string, string>();
+
+export const FileViewer: React.FC<Props> = ({ file, onOpenNotebook }) => {
+  const { sendFileDetails, sendUpdateFile } = useRequestClient();
+  const hotkeys = useAtomValue(hotkeysAtom);
+  const disableFileDownloads = useAtomValue(disableFileDownloadsAtom);
+  const currentNotebookFilename = useAtomValue(filenameAtom);
+  // undefined value means not modified yet
+  const [internalValue, setInternalValue] = useState<string>("");
+
+  const { data, isPending, error, setData, refetch } =
+    useAsyncData(async () => {
+      const details = await sendFileDetails({
+        path: file.path,
+        maxBytes: MAX_FILE_PREVIEW_BYTES,
+      });
+      const mode = getFileRenderMode(details.mimeType, details.isBase64);
+      if (!details.isTooLarge && mode === "text") {
+        const contents = details.contents || "";
+        setInternalValue(unsavedContentsForFile.get(file.path) ?? contents);
+      }
+      return details;
+    }, [file.path]);
+
+  const handleSaveFile = async () => {
+    if (internalValue === data?.contents) {
+      return;
+    }
+
+    await sendUpdateFile({ path: file.path, contents: internalValue }).then(
+      (response) => {
+        if (response.success) {
+          // Update the last saved value
+          setData((prev) => ({ ...prev, contents: internalValue }));
+          setInternalValue(internalValue);
+        }
+      },
+    );
+  };
+
+  // On file change or unmount, save the unsaved contents. Only editable text
+  // previews participate in editor state; oversized and non-text responses
+  // carry no draft to preserve.
+  // We use a ref for internalValue so we don't call this effect on each keystroke
+  const internalValueRef = useRef<string>(internalValue);
+  internalValueRef.current = internalValue;
+  useEffect(() => {
+    return () => {
+      if (
+        data?.contents == null ||
+        data.isTooLarge ||
+        getFileRenderMode(data.mimeType, data.isBase64) !== "text"
+      ) {
+        return;
+      }
+      const draft = internalValueRef.current;
+      if (draft === data.contents) {
+        unsavedContentsForFile.delete(file.path);
+      } else {
+        unsavedContentsForFile.set(file.path, draft);
+      }
+    };
+  }, [
+    file.path,
+    data?.contents,
+    data?.isTooLarge,
+    data?.mimeType,
+    data?.isBase64,
+  ]);
+
+  if (error) {
+    return <ErrorBanner error={error} />;
+  }
+
+  if (isPending || !data) {
+    return null;
+  }
+
+  const mimeType = data.mimeType || "text/plain";
+  const renderMode = getFileRenderMode(data.mimeType, data.isBase64);
+  const isText = renderMode === "text";
+  const isCsv = renderMode === "csv";
+  const isMedia = renderMode === "media";
+  const isActiveNotebook =
+    currentNotebookFilename &&
+    data.file.isMarimoFile &&
+    (file.path === currentNotebookFilename ||
+      // This may capture other notebook files in subdirectories
+      // but this is an okay heuristic for now.
+      file.path.endsWith(`/${currentNotebookFilename}`));
+
+  const handleDownload = async () => {
+    await downloadFile(file.path, data.file.name);
+  };
+
+  const saveKeymapExtension = keymap.of([
+    {
+      key: hotkeys.getHotkey("global.save").key,
+      stopPropagation: true,
+      run: () => {
+        if (internalValue !== data.contents) {
+          void handleSaveFile();
+          return true;
+        }
+        return false;
+      },
+    },
+  ]);
+
+  // Defined before the metadata-only returns so refresh, download, and
+  // open-notebook stay available while edit-only copy/save are withheld from
+  // non-text previews.
+  const header = (
+    <FilePreviewHeader
+      filename={data.file.name}
+      onRefresh={refetch}
+      onDownload={disableFileDownloads ? undefined : handleDownload}
+      actions={
+        <>
+          {data.file.isMarimoFile && onOpenNotebook && !isWasm() && (
+            <Tooltip content="Open notebook">
+              <Button
+                variant="text"
+                size="xs"
+                aria-label="Open notebook"
+                onClick={(evt) => onOpenNotebook(evt)}
+              >
+                <ExternalLinkIcon className="h-3.5 w-3.5" />
+              </Button>
+            </Tooltip>
+          )}
+          {isText && (
+            <>
+              <Tooltip content="Copy contents to clipboard">
+                <Button
+                  variant="text"
+                  size="xs"
+                  onClick={async () => {
+                    await copyToClipboard(internalValue);
+                  }}
+                >
+                  <CopyIcon className="h-3.5 w-3.5" />
+                </Button>
+              </Tooltip>
+              <Tooltip content={renderShortcut("global.save")}>
+                <Button
+                  variant="text"
+                  size="xs"
+                  onClick={handleSaveFile}
+                  disabled={internalValue === data.contents}
+                >
+                  <SaveIcon className="h-3.5 w-3.5" />
+                </Button>
+              </Tooltip>
+            </>
+          )}
+        </>
+      }
+    />
+  );
+
+  if (data.isTooLarge || renderMode === "unsupported") {
+    return (
+      <>
+        {header}
+        <FilePreviewMetadata
+          file={data.file}
+          mimeType={mimeType}
+          message={
+            data.isTooLarge
+              ? "File is too large to preview."
+              : "This file type cannot be previewed."
+          }
+          onDownload={disableFileDownloads ? undefined : handleDownload}
+        />
+      </>
+    );
+  }
+
+  const warningBanner = isText && isActiveNotebook && (
+    <Alert variant="warning" className="rounded-none">
+      <AlertTriangleIcon className="h-4 w-4" />
+      <AlertDescription>
+        Editing the notebook file directly while running in marimo's editor may
+        cause unintended changes. Please use with caution.
+      </AlertDescription>
+    </Alert>
+  );
+
+  const mediaSource =
+    isMedia && data.contents
+      ? buildMediaSource({
+          contents: data.contents,
+          mimeType,
+          isBase64: data.isBase64 ?? false,
+        })
+      : undefined;
+
+  return (
+    <>
+      {header}
+      {warningBanner}
+      <FileContentRenderer
+        mimeType={mimeType}
+        filename={data.file.name}
+        contents={
+          isText
+            ? internalValue
+            : isCsv
+              ? (data.contents ?? undefined)
+              : undefined
+        }
+        mediaSource={mediaSource}
+        readOnly={!isText}
+        onChange={isText ? setInternalValue : undefined}
+        extensions={isText ? [saveKeymapExtension] : []}
+      />
+    </>
+  );
+};

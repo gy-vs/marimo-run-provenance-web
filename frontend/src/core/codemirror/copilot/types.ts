@@ -1,0 +1,55 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+/* oxlint-disable typescript/no-empty-object-type */
+
+export interface GitHubCopilotSignInInitiateResult {
+  verificationUri: string; // https://github.com/login/device
+  status: GitHubCopilotStatus; // PromptUserDeviceFlow
+  userCode: string;
+  expiresIn: number; // Seconds (usually 15 minutes)
+  interval: number; // For polling
+  command: {
+    command: string; // github.copilot.finishDeviceFlow
+    title: string; // Sign in with GitHub
+    arguments: string[];
+  };
+}
+
+export interface GitHubCopilotSignInConfirmParams {
+  userCode: string;
+}
+
+/**
+ * Copilot account status.
+ */
+export type GitHubCopilotStatus =
+  | "SignedIn"
+  | "AlreadySignedIn"
+  | "MaybeOk"
+  | "NotAuthorized"
+  | "NotSignedIn"
+  | "PromptUserDeviceFlow"
+  | "OK";
+
+/**
+ * Copilot status.
+ */
+export type GitHubCopilotRequestStatus = "InProgress" | "Warning" | "Normal";
+
+/**
+ * Payload of Copilot's `statusNotification`/`didChangeStatus`. `kind` and
+ * `status` are open strings, not unions: this is a vendor shape we don't
+ * control, and an unrecognized value must not discard the notification.
+ */
+export interface GitHubCopilotStatusNotificationParams {
+  busy: boolean;
+  /** Known values: "Warning" | "Normal" | "Error" | "Inactive" */
+  kind: string | null;
+  message: string | null;
+  /** Known values: "InProgress" | "Warning" | "Normal" */
+  status?: string;
+}
+
+export interface GitHubCopilotStatusResult {
+  status: GitHubCopilotStatus;
+  user: string;
+}

@@ -1,0 +1,1077 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+import type { UIMessage } from "@ai-sdk/react";
+import { useChat } from "@ai-sdk/react";
+import { storePrompt } from "@marimo-team/codemirror-ai";
+import type { ReactCodeMirrorRef } from "@uiw/react-codemirror";
+import {
+  type ChatAddToolApproveResponseFunction,
+  type FileUIPart,
+  safeValidateUIMessages,
+  type TextUIPart,
+} from "ai";
+import { useAtom, useAtomValue, useSetAtom, useStore } from "jotai";
+import {
+  BotMessageSquareIcon,
+  HatGlasses,
+  ArrowRightIcon,
+  Loader2,
+  type LucideIcon,
+  MessageCircleIcon,
+  NotebookText,
+  PlusIcon,
+  SparklesIcon,
+  SettingsIcon,
+  CodeIcon,
+} from "lucide-react";
+import { memo, useEffect, useRef, useState } from "react";
+import useEvent from "react-use-event-hook";
+import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectLabel,
+  SelectTrigger,
+} from "@/components/ui/select";
+import { replaceMessagesInChat } from "@/core/ai/chat-utils";
+import { useAIConfigActions } from "@/core/ai/config";
+import { AI_SDK_UI_THROTTLE_MS } from "@/core/ai/constants";
+import { AiModelId } from "@/core/ai/ids/ids";
+import { useStagedAICellsActions } from "@/core/ai/staged-cells";
+import {
+  activeChatAtom,
+  type Chat,
+  type ChatId,
+  chatOptionsAtom,
+  chatStateAtom,
+  pendingAiPromptAtom,
+} from "@/core/ai/state";
+import type { ToolNotebookContext } from "@/core/ai/tools/base";
+import {
+  type CopilotMode,
+  FRONTEND_TOOL_REGISTRY,
+} from "@/core/ai/tools/registry";
+import { useCellActions } from "@/core/cells/cells";
+import { aiAtom, aiModelConfiguredAtom } from "@/core/config/config";
+import { DEFAULT_AI_MODEL } from "@/core/config/config-schema";
+import { useRequestClient } from "@/core/network/requests";
+import { useRuntimeManager } from "@/core/runtime/config";
+import { isWasm } from "@/core/wasm/utils";
+import { ErrorBanner } from "@/plugins/impl/common/error-banner";
+import { cn } from "@/utils/cn";
+import { Logger } from "@/utils/Logger";
+import { AIModelDropdown } from "../ai/ai-model-dropdown";
+import { useOpenSettingsToTab } from "../app-config/state";
+import { PairWithAgentModal } from "../editor/actions/pair-with-agent-modal";
+import { PromptInput } from "../editor/ai/add-cell-with-ai";
+import {
+  addContextCompletion,
+  CONTEXT_TRIGGER,
+  isContextAttachment,
+  resolveChatContext,
+} from "../editor/ai/completion-utils";
+import { StreamingChunkTransport } from "../editor/ai/transport/chat-transport";
+import { PanelEmptyState } from "../editor/chrome/panels/empty-state";
+import { CopyClipboardIcon } from "../icons/copy-icon";
+import { useImperativeModal } from "../modal/ImperativeModal";
+import { MCPStatusIndicator } from "../mcp/mcp-status-indicator";
+import { Tooltip, TooltipProvider } from "../ui/tooltip";
+import {
+  AddContextButton,
+  AttachFileButton,
+  AttachmentRenderer,
+  FileAttachmentPill,
+  SendButton,
+} from "./chat-components";
+import {
+  describeChatAbortReason,
+  getAbortReasonFromChunk,
+  resolveChatAbortReason,
+} from "./chat-abort";
+import { renderUIMessage } from "./chat-display";
+import { ChatHistoryPopover } from "./chat-history-popover";
+import { CapabilitiesPopover } from "./capabilities-popover";
+import {
+  type ChatMessagePart,
+  convertToFileUIPart,
+  generateChatTitle,
+  handleToolCall,
+  hasPendingToolCalls,
+  hasUnresolvedToolCalls,
+  isLastMessageReasoning,
+  PROVIDERS_THAT_SUPPORT_ATTACHMENTS,
+  type QueuedUserMessage,
+  shouldFlushQueue,
+  useFileState,
+  useMessageQueue,
+} from "./chat-utils";
+import { getCodes } from "@/core/codemirror/copilot/getCodes";
+import { focusInputAndMoveToEnd } from "@/core/codemirror/utils";
+import ScrollToBottomButton from "./acp/scroll-to-bottom-button";
+import { useChatControllerId } from "./use-chat-controller-id";
+
+// Default mode for the AI
+const DEFAULT_MODE = "manual";
+
+const QueuedMessageDisplay = memo(
+  ({ message }: { message: QueuedUserMessage }) => {
+    const textParts = message.parts.filter(
+      (p): p is TextUIPart => p.type === "text",
+    );
+    const content = textParts.map((p) => p.text).join("\n");
+    const fileParts = message.parts.filter(
+      (p): p is FileUIPart => p.type === "file",
+    );
+
+    return (
+      <div className="flex justify-end">
+        <div className="w-[95%] bg-background border border-dashed p-2 rounded-sm opacity-70">
+          {fileParts.map((filePart, idx) => (
+            <AttachmentRenderer attachment={filePart} key={idx} />
+          ))}
+          <div className="flex items-center justify-end gap-2 text-sm text-muted-foreground">
+            <span className="wrap-break-word">{content}</span>
+            <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+          </div>
+        </div>
+      </div>
+    );
+  },
+);
+QueuedMessageDisplay.displayName = "QueuedMessageDisplay";
+
+interface ChatHeaderProps {
+  onNewChat: () => void;
+  activeChatId: ChatId | undefined;
+  setActiveChat: (id: ChatId | null) => void;
+}
+
+const ChatHeader: React.FC<ChatHeaderProps> = ({
+  onNewChat,
+  activeChatId,
+  setActiveChat,
+}) => {
+  const { handleClick } = useOpenSettingsToTab();
+
+  return (
+    <div className="flex border-b px-2 py-1 justify-between shrink-0 items-center">
+      <Tooltip content="New chat">
+        <Button variant="text" size="icon" onClick={onNewChat}>
+          <PlusIcon className="h-4 w-4" />
+        </Button>
+      </Tooltip>
+      <div className="flex items-center gap-2">
+        <MCPStatusIndicator />
+        <Tooltip content="AI Settings">
+          <Button
+            variant="text"
+            size="xs"
+            className="hover:bg-foreground/10 py-2"
+            onClick={() => handleClick("ai")}
+          >
+            <SettingsIcon className="h-4 w-4" />
+          </Button>
+        </Tooltip>
+        <ChatHistoryPopover
+          activeChatId={activeChatId}
+          setActiveChat={setActiveChat}
+        />
+      </div>
+    </div>
+  );
+};
+
+interface ChatMessageProps {
+  message: UIMessage;
+  index: number;
+  onEdit: (index: number, newValue: string) => void;
+  isStreamingReasoning: boolean;
+  isLast: boolean;
+  isActive: boolean;
+  addToolApprovalResponse?: ChatAddToolApproveResponseFunction;
+}
+
+const ChatMessageDisplay: React.FC<ChatMessageProps> = memo(
+  ({
+    message,
+    index,
+    onEdit,
+    isStreamingReasoning,
+    isLast,
+    isActive,
+    addToolApprovalResponse,
+  }) => {
+    const renderUserMessage = (message: UIMessage) => {
+      const textParts = message.parts?.filter(
+        (p): p is TextUIPart => p.type === "text",
+      );
+      const content = textParts?.map((p) => p.text).join("\n");
+      const fileParts = message.parts?.filter(
+        (p): p is FileUIPart => p.type === "file",
+      );
+
+      return (
+        <div className="w-[95%] bg-background border p-1 rounded-sm">
+          {fileParts?.map((filePart, idx) => (
+            <AttachmentRenderer attachment={filePart} key={idx} />
+          ))}
+          <PromptInput
+            key={message.id}
+            value={content}
+            placeholder="Type your message..."
+            onChange={() => {
+              // noop
+            }}
+            onSubmit={(_e, newValue) => {
+              if (!newValue.trim()) {
+                return;
+              }
+              onEdit(index, newValue);
+            }}
+            onClose={() => {
+              // noop
+            }}
+          />
+        </div>
+      );
+    };
+
+    const renderOtherMessage = (message: UIMessage) => {
+      const textParts = message.parts.filter(
+        (p): p is TextUIPart => p.type === "text",
+      );
+      const content = textParts.map((p) => p.text).join("\n");
+
+      return (
+        <div className="w-[95%] wrap-break-word">
+          <div className="absolute right-1 top-1 opacity-0 group-hover:opacity-100 transition-opacity">
+            <CopyClipboardIcon className="h-3 w-3" value={content || ""} />
+          </div>
+          {renderUIMessage({
+            message,
+            isStreamingReasoning,
+            isLast,
+            isActive,
+            addToolApprovalResponse,
+          })}
+        </div>
+      );
+    };
+
+    return (
+      <div
+        className={cn(
+          "flex group relative",
+          message.role === "user" ? "justify-end" : "justify-start",
+        )}
+      >
+        {message.role === "user"
+          ? renderUserMessage(message)
+          : renderOtherMessage(message)}
+      </div>
+    );
+  },
+);
+ChatMessageDisplay.displayName = "ChatMessage";
+
+interface ChatInputFooterProps {
+  isEmpty: boolean;
+  onSendClick: () => void;
+  isLoading: boolean;
+  onStop: () => void;
+  onAddFiles: (files: File[]) => void;
+  fileInputRef: React.RefObject<HTMLInputElement | null>;
+  onAddContext: () => void;
+}
+
+const ChatInputFooter: React.FC<ChatInputFooterProps> = memo(
+  ({
+    isEmpty,
+    onSendClick,
+    isLoading,
+    onStop,
+    fileInputRef,
+    onAddFiles,
+    onAddContext,
+  }) => {
+    const ai = useAtomValue(aiAtom);
+    const currentMode = ai?.mode || DEFAULT_MODE;
+    const currentModel = ai?.models?.chat_model || DEFAULT_AI_MODEL;
+    const currentProvider = AiModelId.parse(currentModel).providerId;
+
+    const { saveModeChange } = useAIConfigActions();
+
+    const modeOptions: {
+      value: CopilotMode;
+      label: string;
+      subtitle: string;
+      Icon: LucideIcon;
+    }[] = [
+      {
+        value: "manual",
+        label: "Manual",
+        subtitle: "Pure chat, no tool usage",
+        Icon: MessageCircleIcon,
+      },
+      {
+        value: "ask",
+        label: "Ask",
+        subtitle: "AI with access to read-only tools like documentation search",
+        Icon: NotebookText,
+      },
+      {
+        value: "agent",
+        label: "Agent",
+        subtitle: "AI with access to read and write tools",
+        Icon: HatGlasses,
+      },
+      {
+        value: "code_mode",
+        label: "Code Mode (beta)",
+        subtitle:
+          "AI with access to the notebook's kernel. Potentially destructive.",
+        Icon: CodeIcon,
+      },
+    ];
+
+    const isAttachmentSupported =
+      PROVIDERS_THAT_SUPPORT_ATTACHMENTS.has(currentProvider);
+
+    const currentModeOption = modeOptions.find((o) => o.value === currentMode);
+    const CurrentModeIcon = currentModeOption?.Icon;
+    const CurrentModeLabel = currentModeOption?.label;
+
+    return (
+      <TooltipProvider>
+        <div className="px-3 py-2 border-t border-border/20 flex flex-wrap items-center gap-1">
+          <div className="flex flex-wrap items-center gap-1">
+            <Select value={currentMode} onValueChange={saveModeChange}>
+              <SelectTrigger className="h-6 text-xs border-border shadow-none! ring-0! bg-muted hover:bg-muted/30 py-0 px-2 gap-1.5 shrink-0">
+                {CurrentModeIcon && <CurrentModeIcon className="h-3 w-3" />}
+                <span className="text-nowrap">{CurrentModeLabel}</span>
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectLabel className="text-xs uppercase tracking-wider text-muted-foreground/70 font-medium">
+                    AI Mode
+                  </SelectLabel>
+                  {modeOptions.map((option) => (
+                    <SelectItem
+                      key={option.value}
+                      value={option.value}
+                      className="text-xs py-1"
+                    >
+                      <div className="flex items-start gap-2.5">
+                        <span className="mt-1 text-muted-foreground">
+                          <option.Icon className="h-3 w-3" />
+                        </span>
+                        <div className="flex flex-col gap-0.5">
+                          <span className="font-semibold">{option.label}</span>
+                          <span className="text-muted-foreground">
+                            {option.subtitle}
+                          </span>
+                        </div>
+                      </div>
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+            <AIModelDropdown
+              placeholder="Model"
+              triggerClassName="h-6 text-xs shadow-none! ring-0! bg-muted hover:bg-muted/30 rounded-sm max-w-[200px]"
+              iconSize="small"
+              showAddCustomModelDocs={true}
+              forRole="chat"
+            />
+            <CapabilitiesPopover />
+          </div>
+          <div className="flex flex-row ml-auto">
+            <AddContextButton
+              handleAddContext={onAddContext}
+              isLoading={isLoading}
+            />
+            {isAttachmentSupported && (
+              <AttachFileButton
+                fileInputRef={fileInputRef}
+                isLoading={isLoading}
+                onAddFiles={onAddFiles}
+              />
+            )}
+            <SendButton
+              isLoading={isLoading}
+              onStop={onStop}
+              onSendClick={onSendClick}
+              isEmpty={isEmpty}
+            />
+          </div>
+        </div>
+      </TooltipProvider>
+    );
+  },
+);
+
+ChatInputFooter.displayName = "ChatInputFooter";
+
+interface ChatInputProps {
+  placeholder?: string;
+  input: string;
+  inputClassName?: string;
+  setInput: (value: string) => void;
+  onSubmit: (e: KeyboardEvent | undefined, value: string) => void;
+  inputRef: React.RefObject<ReactCodeMirrorRef | null>;
+  isLoading: boolean;
+  onStop: () => void;
+  onClose: () => void;
+  fileInputRef: React.RefObject<HTMLInputElement | null>;
+  onAddFiles: (files: File[]) => void;
+}
+
+const ChatInput: React.FC<ChatInputProps> = memo(
+  ({
+    placeholder,
+    input,
+    inputClassName,
+    setInput,
+    onSubmit,
+    inputRef,
+    isLoading,
+    onStop,
+    fileInputRef,
+    onAddFiles,
+    onClose,
+  }) => {
+    const handleSendClick = useEvent(() => {
+      if (input.trim()) {
+        onSubmit(undefined, input);
+      }
+    });
+
+    return (
+      <div className="relative shrink-0 flex flex-col border-t">
+        <div className={cn("px-2 py-1.5", inputClassName)}>
+          <PromptInput
+            className="max-h-[400px]"
+            inputRef={inputRef}
+            value={input}
+            onChange={setInput}
+            onSubmit={onSubmit}
+            onClose={onClose}
+            onAddFiles={onAddFiles}
+            placeholder={placeholder || "Type your message..."}
+          />
+        </div>
+        <ChatInputFooter
+          isEmpty={!input.trim()}
+          onAddContext={() => addContextCompletion(inputRef)}
+          onSendClick={handleSendClick}
+          isLoading={isLoading}
+          onStop={onStop}
+          fileInputRef={fileInputRef}
+          onAddFiles={onAddFiles}
+        />
+      </div>
+    );
+  },
+);
+
+ChatInput.displayName = "ChatInput";
+
+const PairWithAgentCallout: React.FC<{
+  onPairWithAgent: () => void;
+}> = ({ onPairWithAgent }) => {
+  if (isWasm()) {
+    return null;
+  }
+
+  return (
+    <Button
+      variant="text"
+      className="gap-1.5 text-sm text-link hover:underline"
+      onClick={onPairWithAgent}
+    >
+      <SparklesIcon className="h-3.5 w-3.5 shrink-0" />
+      <span>Work on this notebook with your own agent</span>
+      <ArrowRightIcon className="h-3 w-3 shrink-0" />
+    </Button>
+  );
+};
+
+const ChatPanel = () => {
+  const aiConfigured = useAtomValue(aiModelConfiguredAtom);
+  const { handleClick } = useOpenSettingsToTab();
+
+  if (!aiConfigured) {
+    return (
+      <PanelEmptyState
+        title="Chat with AI"
+        description="No AI provider configured or Chat model not selected"
+        action={
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => handleClick("ai", "ai-providers")}
+          >
+            Edit AI settings
+          </Button>
+        }
+        icon={<BotMessageSquareIcon />}
+      />
+    );
+  }
+
+  return <ChatPanelBody />;
+};
+
+const ChatPanelBody = () => {
+  const setChatState = useSetAtom(chatStateAtom);
+  const [activeChat, setActiveChat] = useAtom(activeChatAtom);
+  const [pendingPrompt, setPendingPrompt] = useAtom(pendingAiPromptAtom);
+  const [input, setInput] = useState("");
+  const [newThreadInput, setNewThreadInput] = useState("");
+  const [isScrolledToBottom, setIsScrolledToBottom] = useState(true);
+  const { files, addFiles, clearFiles, removeFile } = useFileState();
+  const {
+    messages: queuedMessages,
+    enqueue: enqueueUserMessage,
+    flushNext: flushNextQueuedMessage,
+    clear: clearQueuedMessages,
+    hasQueuedRef,
+  } = useMessageQueue();
+  const newThreadInputRef = useRef<ReactCodeMirrorRef>(null);
+  const newMessageInputRef = useRef<ReactCodeMirrorRef>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const lastAbortReasonRef = useRef<string | null>(null);
+  const [abortNotice, setAbortNotice] = useState<string | null>(null);
+  const clearAbortState = useEvent(() => {
+    lastAbortReasonRef.current = null;
+    setAbortNotice(null);
+  });
+  const runtimeManager = useRuntimeManager();
+  const { invokeAiTool, sendRun } = useRequestClient();
+  const { openModal, closeModal } = useImperativeModal();
+
+  const activeChatId = activeChat?.id;
+  const { chatControllerId, renewDraftChatId } =
+    useChatControllerId(activeChatId);
+  const store = useStore();
+
+  const { addStagedCell } = useStagedAICellsActions();
+  const { createNewCell, prepareForRun } = useCellActions();
+  const toolContext: ToolNotebookContext = {
+    addStagedCell,
+    createNewCell,
+    prepareForRun,
+    sendRun,
+    store,
+  };
+
+  const {
+    messages,
+    sendMessage,
+    error,
+    status,
+    regenerate,
+    stop,
+    addToolOutput,
+    addToolApprovalResponse,
+    id: chatId,
+  } = useChat({
+    id: chatControllerId,
+    throttle: AI_SDK_UI_THROTTLE_MS,
+    sendAutomaticallyWhen: ({ messages }) => hasPendingToolCalls(messages),
+    messages: activeChat?.messages || [], // initial messages
+    transport: new StreamingChunkTransport(
+      {
+        api: runtimeManager.getAiURL("chat").toString(),
+        headers: () => runtimeManager.headers(),
+        prepareSendMessagesRequest: async (options) => {
+          // Canary: flag outgoing messages that don't match the AI SDK's own
+          // schema. The server-side sanitizer in `_pydantic_ai_utils.py` corrects these before validation;
+          // this log surfaces drift early without affecting the request.
+          const validation = await safeValidateUIMessages({
+            messages: options.messages,
+          });
+          if (!validation.success) {
+            Logger.debug(
+              "Outgoing chat messages failed AI SDK schema validation",
+              validation.error,
+            );
+          }
+
+          const completionBody = {
+            uiMessages: options.messages,
+            includeOtherCode: getCodes(""),
+            options: store.get(chatOptionsAtom),
+          };
+
+          // Call this here to ensure the value is not stale
+          const chatMode = store.get(aiAtom)?.mode || DEFAULT_MODE;
+          const tools = FRONTEND_TOOL_REGISTRY.getToolSchemas(chatMode);
+
+          return {
+            api: runtimeManager.getAiURL("chat").toString(),
+            body: {
+              tools,
+              ...options,
+              ...completionBody,
+            },
+          };
+        },
+      },
+      (chunk) => {
+        const abortReason = getAbortReasonFromChunk(chunk);
+        if (abortReason !== undefined) {
+          lastAbortReasonRef.current = abortReason;
+        }
+      },
+    ),
+    onFinish: ({ messages, isError, isAbort, finishReason }) => {
+      setChatState((prev) => {
+        return replaceMessagesInChat({
+          chatState: prev,
+          chatId: prev.activeChatId,
+          messages: messages,
+        });
+      });
+
+      if (isAbort) {
+        const reason = resolveChatAbortReason({
+          isAbort: true,
+          streamReason: lastAbortReasonRef.current,
+        });
+        clearAbortState();
+        if (reason != null) {
+          const description = describeChatAbortReason(reason);
+          Logger.debug("Chat stream aborted", { reason, finishReason });
+          setAbortNotice(description);
+        }
+      } else {
+        clearAbortState();
+      }
+
+      tryFlushQueuedMessages(messages, { isError, isAbort });
+    },
+    onToolCall: async ({ toolCall }) => {
+      await handleToolCall({
+        invokeAiTool,
+        addToolOutput,
+        toolCall: {
+          toolName: toolCall.toolName,
+          toolCallId: toolCall.toolCallId,
+          input: toolCall.input as Record<string, never>,
+        },
+        toolContext,
+      });
+    },
+    onError: (error) => {
+      Logger.error("An error occurred:", error);
+    },
+  });
+
+  const sendUserMessage = useEvent((parts: ChatMessagePart[]) => {
+    clearAbortState();
+    sendMessage({ role: "user", parts });
+  });
+
+  const tryFlushQueuedMessages = useEvent(
+    (
+      chatMessages: typeof messages,
+      opts: { isError: boolean; isAbort: boolean },
+    ) => {
+      if (!hasQueuedRef.current) {
+        return;
+      }
+      if (
+        shouldFlushQueue({
+          isError: opts.isError,
+          isAbort: opts.isAbort,
+          hasPendingToolCalls: hasPendingToolCalls(chatMessages),
+          hasUnresolvedToolCalls: hasUnresolvedToolCalls(chatMessages),
+        })
+      ) {
+        flushNextQueuedMessage(sendUserMessage);
+      }
+    },
+  );
+
+  const isLoading = status === "submitted" || status === "streaming";
+  // Read via a ref so the queue-vs-send decision stays correct even when it is
+  // made after an `await` (e.g. resolving @-context), by which point the render
+  // closure's `isLoading` may be stale.
+  const isLoadingRef = useRef(isLoading);
+  isLoadingRef.current = isLoading;
+
+  const submitOrQueue = useEvent((parts: ChatMessagePart[]) => {
+    if (isLoadingRef.current || hasQueuedRef.current) {
+      enqueueUserMessage(parts);
+    } else {
+      sendUserMessage(parts);
+    }
+  });
+
+  const handleScroll = useEvent(() => {
+    const container = scrollContainerRef.current;
+    if (!container) {
+      return;
+    }
+
+    const { scrollTop, scrollHeight, clientHeight } = container;
+    const hasOverflow = scrollHeight > clientHeight;
+    const isAtBottom = hasOverflow
+      ? Math.abs(scrollHeight - clientHeight - scrollTop) < 5
+      : true;
+    setIsScrolledToBottom(isAtBottom);
+  });
+
+  const scrollToBottom = useEvent((smooth = false) => {
+    const container = scrollContainerRef.current;
+    if (!container) {
+      return;
+    }
+
+    container.scrollTo({
+      top: container.scrollHeight,
+      behavior: smooth ? "smooth" : "auto",
+    });
+  });
+
+  // Check if we're currently streaming reasoning in the latest message
+  const isStreamingReasoning =
+    isLoading && messages.length > 0 && isLastMessageReasoning(messages);
+
+  // Pin to the bottom while the user is already there.
+  useEffect(() => {
+    setIsScrolledToBottom(true);
+    clearQueuedMessages();
+    clearAbortState();
+  }, [activeChatId, clearQueuedMessages, clearAbortState]);
+
+  useEffect(() => {
+    if (!isScrolledToBottom) {
+      return;
+    }
+    const frame = requestAnimationFrame(() => {
+      scrollToBottom();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [messages, queuedMessages, isLoading, isScrolledToBottom, scrollToBottom]);
+
+  // Retry when tool parts resolve after the stream ends (e.g. assistant text
+  // trails a still-running tool call, so `onFinish` alone cannot flush).
+  useEffect(() => {
+    if (isLoading) {
+      return;
+    }
+    tryFlushQueuedMessages(messages, {
+      isError: error != null,
+      isAbort: false,
+    });
+  }, [messages, isLoading, error, tryFlushQueuedMessages]);
+
+  const startNewChatState = useEvent((initialMessage: string) => {
+    const now = Date.now();
+    const newChat: Chat = {
+      id: chatId as ChatId,
+      title: generateChatTitle(initialMessage),
+      messages: [],
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    setChatState((prev) => {
+      const newChats = new Map(prev.chats);
+      newChats.set(newChat.id, newChat);
+      return {
+        ...prev,
+        chats: newChats,
+        activeChatId: newChat.id,
+      };
+    });
+  });
+
+  const createNewThread = useEvent(
+    async (initialMessage: string, initialAttachments?: File[]) => {
+      startNewChatState(initialMessage);
+
+      const fileParts =
+        initialAttachments && initialAttachments.length > 0
+          ? await convertToFileUIPart(initialAttachments)
+          : undefined;
+      const { contextPart, attachments } =
+        await resolveChatContext(initialMessage);
+
+      sendMessage({
+        role: "user",
+        parts: [
+          { type: "text" as const, text: initialMessage },
+          ...(contextPart ? [contextPart] : []),
+          ...(fileParts ?? []),
+          ...attachments,
+        ],
+      });
+      clearFiles();
+      setInput("");
+    },
+  );
+
+  const handleNewChat = useEvent(() => {
+    renewDraftChatId();
+    setActiveChat(null);
+    setInput("");
+    setNewThreadInput("");
+    clearQueuedMessages();
+    clearFiles();
+  });
+
+  const handlePairWithAgent = useEvent(() => {
+    openModal(<PairWithAgentModal onClose={closeModal} />);
+  });
+
+  const handleMessageEdit = useEvent(
+    async (index: number, newValue: string) => {
+      const editedMessage = messages[index];
+      // Keep the user's own uploaded files, but drop the previous @-context
+      // snapshot (data part + its attachments) so we can re-resolve a fresh,
+      // point-in-time snapshot from the edited text below.
+      const userFileParts =
+        editedMessage.parts?.filter(
+          (p) => p.type === "file" && !isContextAttachment(p),
+        ) ?? [];
+      const { contextPart, attachments } = await resolveChatContext(newValue);
+
+      const messageId = editedMessage.id;
+      sendMessage({
+        messageId: messageId, // replace the message
+        role: "user",
+        parts: [
+          { type: "text", text: newValue },
+          ...(contextPart ? [contextPart] : []),
+          ...userFileParts,
+          ...attachments,
+        ],
+      });
+    },
+  );
+
+  const handleChatInputSubmit = useEvent(
+    async (e: KeyboardEvent | undefined, newValue: string): Promise<void> => {
+      if (!newValue.trim()) {
+        return;
+      }
+      if (newMessageInputRef.current?.view) {
+        storePrompt(newMessageInputRef.current.view);
+      }
+      const fileParts = files ? await convertToFileUIPart(files) : undefined;
+      const { contextPart, attachments } = await resolveChatContext(newValue);
+
+      e?.preventDefault();
+      submitOrQueue([
+        { type: "text", text: newValue },
+        ...(contextPart ? [contextPart] : []),
+        ...(fileParts ?? []),
+        ...attachments,
+      ]);
+      setInput("");
+      clearFiles();
+    },
+  );
+
+  const handleReload = () => {
+    clearAbortState();
+    regenerate();
+  };
+
+  const handleNewThreadSubmit = useEvent(() => {
+    if (!newThreadInput.trim()) {
+      return;
+    }
+    if (newThreadInputRef.current?.view) {
+      storePrompt(newThreadInputRef.current.view);
+    }
+    createNewThread(newThreadInput.trim(), files);
+  });
+
+  const handleOnCloseThread = () => newThreadInputRef.current?.editor?.blur();
+
+  const submitPendingPrompt = useEvent(async (prompt: string) => {
+    if (activeChatId == null) {
+      startNewChatState(prompt);
+      // Starting a chat swaps the new-thread input for the regular input;
+      // carry over any draft the user had typed so it isn't lost.
+      setInput(newThreadInput);
+    }
+    const { contextPart, attachments } = await resolveChatContext(prompt);
+    submitOrQueue([
+      { type: "text", text: prompt },
+      ...(contextPart ? [contextPart] : []),
+      ...attachments,
+    ]);
+  });
+
+  const isNewThread = messages.length === 0;
+
+  // Deliver a prompt queued elsewhere (e.g. error auto-fix) to the chat,
+  // appending to the active thread or starting one if none exists.
+  useEffect(() => {
+    if (!pendingPrompt) {
+      return;
+    }
+    setPendingPrompt(null);
+    const { prompt, submit } = pendingPrompt;
+    if (submit) {
+      void submitPendingPrompt(prompt);
+    } else if (isNewThread) {
+      setNewThreadInput(prompt);
+      focusInputAndMoveToEnd(newThreadInputRef);
+    } else {
+      setInput(prompt);
+      focusInputAndMoveToEnd(newMessageInputRef);
+    }
+  }, [pendingPrompt, setPendingPrompt, isNewThread, submitPendingPrompt]);
+
+  const chatInput = isNewThread ? (
+    <ChatInput
+      key="new-thread-input"
+      placeholder={`Ask anything, ${CONTEXT_TRIGGER} to include context about tables or dataframes`}
+      input={newThreadInput}
+      inputRef={newThreadInputRef}
+      inputClassName="px-1 py-0"
+      setInput={setNewThreadInput}
+      onSubmit={handleNewThreadSubmit}
+      isLoading={isLoading}
+      onStop={stop}
+      fileInputRef={fileInputRef}
+      onAddFiles={addFiles}
+      onClose={handleOnCloseThread}
+    />
+  ) : (
+    <ChatInput
+      input={input}
+      setInput={setInput}
+      onSubmit={handleChatInputSubmit}
+      inputRef={newMessageInputRef}
+      isLoading={isLoading}
+      onStop={stop}
+      onClose={() => newMessageInputRef.current?.editor?.blur()}
+      fileInputRef={fileInputRef}
+      onAddFiles={addFiles}
+    />
+  );
+
+  const filesPills = files && files.length > 0 && (
+    <div
+      className={cn(
+        "flex flex-row gap-1 flex-wrap p-1",
+        isNewThread && "py-2 px-1",
+      )}
+    >
+      {files?.map((file) => (
+        <FileAttachmentPill
+          file={file}
+          key={file.name}
+          onRemove={() => removeFile(file)}
+        />
+      ))}
+    </div>
+  );
+
+  return (
+    <div className="flex flex-col h-[calc(100%-53px)]">
+      <TooltipProvider>
+        <ChatHeader
+          onNewChat={handleNewChat}
+          activeChatId={activeChat?.id}
+          setActiveChat={setActiveChat}
+        />
+      </TooltipProvider>
+
+      <div className="flex-1 flex flex-col overflow-hidden relative min-h-0">
+        <div
+          className="flex-1 px-3 bg-(--slate-1) gap-4 py-3 flex flex-col overflow-y-auto"
+          ref={scrollContainerRef}
+          onScroll={handleScroll}
+        >
+          {isNewThread && (
+            <div className="flex flex-col gap-2">
+              <div className="rounded-md border bg-background">
+                {filesPills}
+                {chatInput}
+              </div>
+              <PairWithAgentCallout onPairWithAgent={handlePairWithAgent} />
+            </div>
+          )}
+
+          {messages.map((message, idx) => (
+            <ChatMessageDisplay
+              key={message.id}
+              message={message}
+              index={idx}
+              onEdit={handleMessageEdit}
+              isStreamingReasoning={isStreamingReasoning}
+              isLast={idx === messages.length - 1}
+              isActive={isLoading}
+              addToolApprovalResponse={addToolApprovalResponse}
+            />
+          ))}
+
+          {queuedMessages.map((message) => (
+            <QueuedMessageDisplay key={message.id} message={message} />
+          ))}
+
+          {isLoading && (
+            <div className="flex justify-center py-4">
+              <Loader2 className="h-4 w-4 animate-spin" />
+            </div>
+          )}
+
+          {error && (
+            <div className="flex items-center justify-center space-x-2 mb-4">
+              <ErrorBanner error={error || new Error("Unknown error")} />
+              <Button variant="outline" size="sm" onClick={handleReload}>
+                Retry
+              </Button>
+            </div>
+          )}
+
+          {abortNotice && !isLoading && !error && (
+            <div className="flex justify-center py-2">
+              <span className="text-xs text-muted-foreground">
+                {abortNotice}
+              </span>
+            </div>
+          )}
+        </div>
+
+        <ScrollToBottomButton
+          isVisible={
+            !isScrolledToBottom &&
+            (messages.length > 0 || queuedMessages.length > 0)
+          }
+          onScrollToBottom={() => scrollToBottom(true)}
+        />
+      </div>
+
+      {isLoading && (
+        <div className="w-full flex justify-center items-center z-20 border-t">
+          <Button variant="linkDestructive" size="sm" onClick={stop}>
+            Stop
+          </Button>
+        </div>
+      )}
+
+      {/* For existing threads, we place the chat input at the bottom */}
+      {!isNewThread && (
+        <>
+          {filesPills}
+          {chatInput}
+        </>
+      )}
+    </div>
+  );
+};
+
+export default ChatPanel;

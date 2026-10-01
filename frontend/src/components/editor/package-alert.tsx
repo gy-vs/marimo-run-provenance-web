@@ -1,0 +1,753 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+import { zodResolver } from "@hookform/resolvers/zod";
+import {
+  BoxIcon,
+  CheckIcon,
+  ChevronDownIcon,
+  ChevronRightIcon,
+  DownloadCloudIcon,
+  PackageCheckIcon,
+  PackageXIcon,
+  PlusIcon,
+  RotateCwIcon,
+  XIcon,
+} from "lucide-react";
+import type React from "react";
+import { useEffect, useState } from "react";
+import { useForm } from "react-hook-form";
+import type { z } from "zod";
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormMessage,
+} from "@/components/ui/form";
+import {
+  type EnvironmentOperationAlert,
+  isEnvironmentOperationAlert,
+  isMissingPackageAlert,
+  useAlertActions,
+  useAlerts,
+} from "@/core/alerts/state";
+import { useResolvedMarimoConfig } from "@/core/config/config";
+import type { PackageOperationStatus } from "@/core/kernel/messages";
+import { useRequestClient } from "@/core/network/requests";
+import { RESTART_REQUIRED_DESCRIPTION } from "@/core/packages/toast-components";
+import { isWasm } from "@/core/wasm/utils";
+import { usePackageMetadata } from "@/hooks/usePackageMetadata";
+import { Banner } from "@/plugins/impl/common/error-banner";
+import { assertNever, logNever } from "@/utils/assertNever";
+import { cn } from "@/utils/cn";
+import { Logger } from "@/utils/Logger";
+import {
+  type PackageManagerName,
+  PackageManagerNames,
+  type UserConfig,
+  UserConfigSchema,
+} from "../../core/config/config-schema";
+import { getDirtyValues } from "../app-config/get-dirty-values";
+import { Button } from "../ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuTrigger,
+} from "../ui/dropdown-menu";
+import { ExternalLink } from "../ui/links";
+import { NativeSelect } from "../ui/native-select";
+import { Tooltip } from "../ui/tooltip";
+import { useRestartKernel } from "./actions/useRestartKernel";
+
+const RestartKernelButton = () => {
+  const restartKernel = useRestartKernel();
+  return <Button onClick={restartKernel}>Restart Kernel</Button>;
+};
+
+function parsePackageSpecifier(spec: string): {
+  name: string;
+  extras: string[];
+} {
+  const match = spec.match(/^([^[]+)(?:\[([^\]]+)])?$/);
+  if (!match) {
+    return { name: spec, extras: [] };
+  }
+  const [, name, extrasStr] = match;
+  const extras = extrasStr ? extrasStr.split(",").map((e) => e.trim()) : [];
+  return { name, extras };
+}
+
+function buildPackageSpecifier(name: string, extras: string[]): string {
+  if (extras.length === 0) {
+    return name;
+  }
+  return `${name}[${extras.join(",")}]`;
+}
+
+const SourceBadge: React.FC<{ source?: "kernel" | "server" }> = ({
+  source,
+}) => {
+  if (source !== "server") {
+    return null;
+  }
+  return (
+    <Tooltip content="Installing into the server environment, not the notebook kernel">
+      <span className="ml-2 text-xs font-normal border border-current rounded px-1 py-0.5 opacity-60">
+        server
+      </span>
+    </Tooltip>
+  );
+};
+
+export const PackageAlert: React.FC = () => {
+  const { packageAlert } = useAlerts();
+  const { clearPackageAlert } = useAlertActions();
+  const [userConfig] = useResolvedMarimoConfig();
+  const [desiredPackageVersions, setDesiredPackageVersions] = useState<
+    Record<string, string>
+  >({});
+  const [selectedExtras, setSelectedExtras] = useState<
+    Record<string, string[]>
+  >({});
+
+  const completedAlertId =
+    packageAlert?.kind === "environment" &&
+    packageAlert.status.kind === "succeeded" &&
+    !packageAlert.restartRequired
+      ? packageAlert.id
+      : null;
+  useEffect(() => {
+    if (completedAlertId === null) {
+      return;
+    }
+    const timeout = setTimeout(
+      () => clearPackageAlert(completedAlertId),
+      10_000,
+    );
+    return () => clearTimeout(timeout);
+  }, [completedAlertId, clearPackageAlert]);
+
+  if (packageAlert === null) {
+    return null;
+  }
+
+  const doesSupportVersioning =
+    userConfig.package_management.manager !== "pixi";
+
+  if (isMissingPackageAlert(packageAlert)) {
+    return (
+      <div className="flex flex-col gap-4 mb-5 fixed top-5 left-12 min-w-[400px] z-200 opacity-95 max-w-[600px] pointer-events-none">
+        <Banner
+          kind="danger"
+          className="flex flex-col rounded py-3 px-5 animate-in slide-in-from-left overflow-auto max-h-[80vh] scrollbar-thin pointer-events-auto"
+        >
+          <div className="flex justify-between">
+            <span className="font-bold text-lg flex items-center mb-2">
+              <PackageXIcon className="w-5 h-5 inline-block mr-2" />
+              Missing packages
+              <SourceBadge source={packageAlert.source} />
+            </span>
+            <Button
+              variant="text"
+              data-testid="remove-banner-button"
+              size="icon"
+              onClick={() => clearPackageAlert(packageAlert.id)}
+            >
+              <XIcon className="w-5 h-5" />
+            </Button>
+          </div>
+          <div className="flex flex-col gap-4 justify-between items-start text-muted-foreground text-base">
+            <div>
+              <p>The following packages were not found:</p>
+              <table className="list-disc ml-2 mt-1">
+                <tbody>
+                  {packageAlert.packages.map((pkg, index) => {
+                    const parsed = parsePackageSpecifier(pkg);
+                    const currentExtras = selectedExtras[pkg] || parsed.extras;
+
+                    return (
+                      <tr className="font-mono text-sm" key={index}>
+                        <td className="pr-2 py-1 align-middle">
+                          <BoxIcon size="1rem" />
+                        </td>
+                        <td className="pr-2 py-1 align-middle">
+                          <ExtrasSelector
+                            packageName={parsed.name}
+                            selectedExtras={currentExtras}
+                            onExtrasChange={(extras) =>
+                              setSelectedExtras((prev) => ({
+                                ...prev,
+                                [pkg]: extras,
+                              }))
+                            }
+                          />
+                        </td>
+                        {doesSupportVersioning && (
+                          <td className="pr-2 py-1 align-middle">
+                            <PackageVersionSelect
+                              value={desiredPackageVersions[pkg] ?? "latest"}
+                              onChange={(value) =>
+                                setDesiredPackageVersions((prev) => ({
+                                  ...prev,
+                                  [pkg]: value,
+                                }))
+                              }
+                              packageName={parsed.name}
+                            />
+                          </td>
+                        )}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <div className="ml-auto flex flex-row items-baseline">
+              {packageAlert.isolated ? (
+                <>
+                  <InstallPackagesButton
+                    manager={userConfig.package_management.manager}
+                    packages={packageAlert.packages.map((pkg) => {
+                      const parsed = parsePackageSpecifier(pkg);
+                      const currentExtras =
+                        selectedExtras[pkg] || parsed.extras;
+                      return buildPackageSpecifier(parsed.name, currentExtras);
+                    })}
+                    versions={desiredPackageVersions}
+                    clearPackageAlert={() => clearPackageAlert(packageAlert.id)}
+                    source={packageAlert.source}
+                  />
+
+                  {!isWasm() && (
+                    <>
+                      <span className="px-2 text-sm">with</span>{" "}
+                      <PackageManagerForm />
+                    </>
+                  )}
+                </>
+              ) : (
+                <p>
+                  If you set up a{" "}
+                  <ExternalLink href="https://docs.python.org/3/tutorial/venv.html#creating-virtual-environments">
+                    virtual environment
+                  </ExternalLink>
+                  , marimo can install these packages for you.
+                </p>
+              )}
+            </div>
+          </div>
+        </Banner>
+      </div>
+    );
+  }
+
+  if (isEnvironmentOperationAlert(packageAlert)) {
+    const { status, title, titleIcon, description } =
+      getOperationStatusElements(packageAlert);
+
+    return (
+      <div className="flex flex-col gap-4 mb-5 fixed top-5 left-12 min-w-[400px] z-200 opacity-95 max-w-[600px] pointer-events-none">
+        <Banner
+          kind={status === "failed" ? "danger" : "info"}
+          className="flex flex-col rounded pt-3 pb-4 px-5 overflow-auto max-h-[80vh] scrollbar-thin pointer-events-auto"
+        >
+          <div className="flex justify-between">
+            <span className="font-bold text-lg flex items-center mb-2">
+              {titleIcon}
+              {title}
+              <SourceBadge source={packageAlert.source} />
+            </span>
+            <Button
+              variant="text"
+              data-testid="remove-banner-button"
+              size="icon"
+              onClick={() => clearPackageAlert(packageAlert.id)}
+            >
+              <XIcon className="w-5 h-5" />
+            </Button>
+          </div>
+          <div
+            className={cn(
+              "flex flex-col gap-4 justify-between items-start text-muted-foreground text-base",
+              status === "succeeded" && "text-accent-foreground",
+            )}
+          >
+            <p>{description}</p>
+            {status !== "running" && packageAlert.restartRequired && (
+              <>
+                {status !== "restart-required" && (
+                  <p>{RESTART_REQUIRED_DESCRIPTION}</p>
+                )}
+                <RestartKernelButton />
+              </>
+            )}
+            <ul className="list-disc ml-2 mt-1">
+              {Object.entries(packageAlert.packages).map(([pkg, st], index) => (
+                <li
+                  className={cn(
+                    "flex items-center gap-1 font-mono text-sm",
+                    st === "running" && "font-semibold",
+                    st === "failed" && "text-destructive",
+                    st === "succeeded" && "text-accent-foreground",
+                    st === "succeeded" &&
+                      status === "failed" &&
+                      "text-muted-foreground",
+                  )}
+                  key={index}
+                >
+                  <ProgressIcon status={st} />
+                  {pkg}
+                </li>
+              ))}
+            </ul>
+            {Object.keys(packageAlert.logs).length > 0 && (
+              <StreamingLogsViewer
+                key={packageAlert.id}
+                packageLogs={packageAlert.logs}
+              />
+            )}
+          </div>
+        </Banner>
+      </div>
+    );
+  }
+
+  logNever(packageAlert);
+  return null;
+};
+
+function getOperationStatusElements({
+  action,
+  status: outcome,
+  restartRequired,
+}: EnvironmentOperationAlert) {
+  const status: EnvironmentOperationAlert["status"] =
+    outcome.kind === "succeeded" && restartRequired
+      ? { kind: "restart-required", reason: RESTART_REQUIRED_DESCRIPTION }
+      : outcome;
+  const titles = {
+    install: {
+      running: "Installing packages",
+      succeeded: "All packages installed!",
+      failed: "Some packages failed to install",
+      cancelled: "Package installation cancelled",
+    },
+    remove: {
+      running: "Removing packages",
+      succeeded: "Packages removed",
+      failed: "Some packages failed to remove",
+      cancelled: "Package removal cancelled",
+    },
+  }[action];
+  switch (status.kind) {
+    case "running":
+      return {
+        status: "running",
+        title: titles.running,
+        titleIcon: <DownloadCloudIcon className="w-5 h-5 inline-block mr-2" />,
+        description:
+          action === "install" ? "Installing packages:" : "Removing packages:",
+      };
+    case "restart-required":
+      return {
+        status: "restart-required",
+        title: "Changes saved — restart required",
+        titleIcon: <RotateCwIcon className="w-5 h-5 inline-block mr-2" />,
+        description: status.reason,
+      };
+    case "succeeded":
+      return {
+        status: "succeeded",
+        title: titles.succeeded,
+        titleIcon: <PackageCheckIcon className="w-5 h-5 inline-block mr-2" />,
+        description:
+          action === "install" ? "Installed packages:" : "Removed packages:",
+      };
+    case "failed":
+      return {
+        status: "failed",
+        title: titles.failed,
+        titleIcon: <PackageXIcon className="w-5 h-5 inline-block mr-2" />,
+        description: status.error,
+      };
+    case "cancelled":
+      return {
+        status: "cancelled",
+        title: titles.cancelled,
+        titleIcon: <XIcon className="w-5 h-5 inline-block mr-2" />,
+        description:
+          "The operation was interrupted. Some packages may have changed.",
+      };
+    default:
+      return assertNever(status);
+  }
+}
+
+const ProgressIcon = ({
+  status,
+}: {
+  status: PackageOperationStatus[string];
+}) => {
+  switch (status) {
+    case "queued":
+      return <BoxIcon size="1rem" />;
+    case "running":
+      return <DownloadCloudIcon size="1rem" />;
+    case "succeeded":
+      return <CheckIcon size="1rem" />;
+    case "failed":
+      return <XIcon size="1rem" />;
+    case "restart-required":
+      return <RotateCwIcon size="1rem" />;
+    default:
+      logNever(status);
+      return null;
+  }
+};
+
+const InstallPackagesButton = ({
+  manager,
+  packages,
+  versions,
+  clearPackageAlert,
+  source,
+}: {
+  manager: PackageManagerName;
+  packages: string[];
+  versions: Record<string, string>;
+  clearPackageAlert: () => void;
+  source?: "kernel" | "server";
+}) => {
+  const { sendInstallMissingPackages } = useRequestClient();
+  return (
+    <Button
+      variant="outline"
+      data-testid="install-packages-button"
+      size="sm"
+      onClick={async () => {
+        clearPackageAlert();
+
+        // Empty version implies latest
+        const completePackages = { ...versions };
+        for (const pkg of packages) {
+          completePackages[pkg] = completePackages[pkg] ?? "";
+        }
+
+        await sendInstallMissingPackages({
+          manager,
+          versions: completePackages,
+          source,
+        }).catch((error) => {
+          Logger.error(error);
+        });
+      }}
+    >
+      <DownloadCloudIcon className="w-4 h-4 mr-2" />
+      <span className="font-semibold">Install</span>
+    </Button>
+  );
+};
+
+const PackageManagerForm: React.FC = () => {
+  const [config, setConfig] = useResolvedMarimoConfig();
+  const { saveUserConfig } = useRequestClient();
+
+  // Create form
+  const form = useForm({
+    resolver: zodResolver(
+      UserConfigSchema as unknown as z.ZodType<unknown, UserConfig>,
+    ),
+    defaultValues: config,
+  });
+
+  const onSubmit = async (values: UserConfig) => {
+    // Only send values that were actually changed to avoid
+    // overwriting backend values the form doesn't manage
+    const dirtyValues = getDirtyValues(values, form.formState.dirtyFields);
+    if (Object.keys(dirtyValues).length === 0) {
+      return; // Nothing changed
+    }
+    await saveUserConfig({ config: dirtyValues }).then(() => {
+      // Update local state with form values
+      setConfig((prev) => ({ ...prev, ...values }));
+    });
+  };
+
+  return (
+    <Form {...form}>
+      <form
+        onChange={form.handleSubmit(onSubmit)}
+        className="flex flex-col gap-5"
+      >
+        <div className="flex flex-col gap-3">
+          <FormField
+            control={form.control}
+            name="package_management.manager"
+            render={({ field }) => (
+              <FormItem>
+                <FormControl>
+                  <NativeSelect
+                    data-testid="install-package-manager-select"
+                    onChange={(e) => field.onChange(e.target.value)}
+                    value={field.value}
+                    disabled={field.disabled}
+                    className="inline-flex mr-2"
+                  >
+                    {PackageManagerNames.map((option) => (
+                      <option value={option} key={option}>
+                        {option}
+                      </option>
+                    ))}
+                  </NativeSelect>
+                </FormControl>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+        </div>
+      </form>
+    </Form>
+  );
+};
+
+interface PackageVersionSelectProps {
+  value: string;
+  onChange: (value: string) => void;
+  packageName: string;
+}
+
+interface ExtrasSelectorProps {
+  packageName: string;
+  selectedExtras: string[];
+  onExtrasChange: (extras: string[]) => void;
+}
+
+const ExtrasSelector: React.FC<ExtrasSelectorProps> = ({
+  packageName,
+  selectedExtras,
+  onExtrasChange,
+}) => {
+  const [isOpen, setIsOpen] = useState(false);
+  const { isPending, error, data: pkgMeta } = usePackageMetadata(packageName);
+
+  const handleExtraToggle = (extra: string, checked: boolean) => {
+    if (checked) {
+      onExtrasChange([...selectedExtras, extra]);
+    } else {
+      onExtrasChange(selectedExtras.filter((e) => e !== extra));
+    }
+  };
+
+  const canSelectExtras = !isPending && !error;
+  const availableExtras = (pkgMeta?.extras ?? []).filter(
+    // Filter out common development-only extras like "dev" and "test".
+    (extra) => !/^(dev|test|testing)$/i.test(extra),
+  );
+
+  return (
+    <div className="flex items-center max-w-72">
+      <span className="shrink-0 flex-1">{packageName}</span>
+
+      {selectedExtras.length > 0 ? (
+        <span className="flex items-center min-w-0 flex-1">
+          <span className="shrink-0">[</span>
+          <DropdownMenu
+            open={isOpen && canSelectExtras}
+            onOpenChange={(open) => {
+              if (canSelectExtras) {
+                setIsOpen(open);
+              }
+            }}
+          >
+            <DropdownMenuTrigger asChild={true}>
+              <button
+                className="hover:bg-muted/50 rounded text-sm px-1 transition-colors border border-muted-foreground/30 hover:border-muted-foreground/60 min-w-0 flex-1 truncate text-left"
+                title={`Selected extras: ${selectedExtras.join(", ")}`}
+                type="button"
+              >
+                {selectedExtras.join(",")}
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent
+              align="start"
+              className="w-64 p-0 max-h-96 flex flex-col"
+            >
+              {selectedExtras.length > 0 && (
+                <div className="p-2 bg-popover border-b border-border">
+                  <div className="flex flex-wrap gap-1 p-1 min-h-[24px]">
+                    {selectedExtras.map((extra) => (
+                      <span
+                        key={extra}
+                        className="inline-flex items-center gap-1 px-1 py-0.5 text-sm font-mono border border-muted-foreground/30 hover:border-muted-foreground/60 rounded-sm cursor-pointer group transition-colors"
+                        onClick={() => handleExtraToggle(extra, false)}
+                      >
+                        {extra}
+                        <XIcon className="w-3 h-3 opacity-60 group-hover:opacity-100" />
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+              <div className="overflow-y-auto flex-1">
+                {availableExtras.map((extra) => (
+                  <DropdownMenuCheckboxItem
+                    key={extra}
+                    checked={selectedExtras.includes(extra)}
+                    onCheckedChange={(checked) => {
+                      handleExtraToggle(extra, checked);
+                    }}
+                    className="font-mono text-sm"
+                    onSelect={(e) => e.preventDefault()}
+                  >
+                    {extra}
+                  </DropdownMenuCheckboxItem>
+                ))}
+              </div>
+            </DropdownMenuContent>
+          </DropdownMenu>
+          <span className="shrink-0">]</span>
+        </span>
+      ) : availableExtras.length > 0 ? (
+        <DropdownMenu
+          open={isOpen && canSelectExtras}
+          onOpenChange={(open) => {
+            if (canSelectExtras) {
+              setIsOpen(open);
+            }
+          }}
+        >
+          <DropdownMenuTrigger asChild={true}>
+            <button
+              disabled={!canSelectExtras}
+              className={cn(
+                "hover:bg-muted/50 rounded text-sm ml-2 transition-colors border border-muted-foreground/30 hover:border-muted-foreground/60 h-5 w-5 flex items-center justify-center p-0",
+                !canSelectExtras && "opacity-50 cursor-not-allowed",
+              )}
+              title={canSelectExtras ? "Add extras" : "Loading extras..."}
+              type="button"
+            >
+              <PlusIcon className="w-3 h-3 shrink-0" />
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent
+            align="start"
+            className="w-64 p-0 max-h-96 flex flex-col"
+          >
+            <div className="p-2 bg-popover border-b border-border">
+              <span className="text-muted-foreground italic text-sm">
+                Package extras
+              </span>
+            </div>
+            <div className="overflow-y-auto flex-1">
+              {availableExtras.map((extra) => (
+                <DropdownMenuCheckboxItem
+                  key={extra}
+                  checked={selectedExtras.includes(extra)}
+                  onCheckedChange={(checked) => {
+                    handleExtraToggle(extra, checked);
+                  }}
+                  className="font-mono text-sm"
+                  onSelect={(e) => e.preventDefault()}
+                >
+                  {extra}
+                </DropdownMenuCheckboxItem>
+              ))}
+            </div>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      ) : null}
+    </div>
+  );
+};
+
+const PackageVersionSelect: React.FC<PackageVersionSelectProps> = ({
+  value,
+  onChange,
+  packageName,
+}) => {
+  const { error, isPending, data: pkgMeta } = usePackageMetadata(packageName);
+
+  if (error) {
+    return (
+      <Tooltip content="Failed to fetch package versions">
+        <NativeSelect
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          disabled={true}
+          className="inline-flex ml-2 w-24 text-ellipsis"
+        >
+          <option value="latest">latest</option>
+        </NativeSelect>
+      </Tooltip>
+    );
+  }
+
+  return (
+    <NativeSelect
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      disabled={isPending}
+      className="inline-flex ml-2 w-24 text-ellipsis"
+    >
+      {isPending ? (
+        <option value="latest">latest</option>
+      ) : (
+        ["latest", ...pkgMeta.versions.slice(0, 100)].map((version) => (
+          <option value={version} key={version}>
+            {version}
+          </option>
+        ))
+      )}
+    </NativeSelect>
+  );
+};
+
+interface StreamingLogsViewerProps {
+  packageLogs: { [packageName: string]: string };
+}
+
+const StreamingLogsViewer: React.FC<StreamingLogsViewerProps> = ({
+  packageLogs,
+}) => {
+  const [isExpanded, setIsExpanded] = useState(true);
+
+  const packageCount = Object.keys(packageLogs).length;
+  if (packageCount === 0) {
+    return null;
+  }
+
+  return (
+    <div className="mt-4 border-t border-border pt-4 w-full contain-inline-size">
+      <button
+        onClick={() => setIsExpanded(!isExpanded)}
+        className="flex items-center gap-2 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors"
+        type="button"
+      >
+        {isExpanded ? (
+          <ChevronDownIcon className="w-4 h-4" />
+        ) : (
+          <ChevronRightIcon className="w-4 h-4" />
+        )}
+        Logs
+      </button>
+
+      {isExpanded && (
+        <div className="mt-3 space-y-3 w-full">
+          {Object.entries(packageLogs).map(([packageName, logs]) => (
+            <div key={packageName} className="w-full">
+              <h4 className="font-mono text-sm font-medium mb-2 text-foreground">
+                {packageName}
+              </h4>
+              <div className="border border-border rounded w-full">
+                <pre className="p-3 text-xs font-mono bg-background max-h-64 overflow-auto text-muted-foreground whitespace-pre scrollbar-thin">
+                  {logs || "No logs available"}
+                </pre>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};

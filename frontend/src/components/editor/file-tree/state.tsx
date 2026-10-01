@@ -1,0 +1,23 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+import { atom } from "jotai";
+import { requestClientAtom } from "@/core/network/requests";
+import { invariant } from "@/utils/invariant";
+import { RequestingTree } from "./requesting-tree";
+
+// State lives outside of the component
+// to preserve the state when the component is unmounted
+export const treeAtom = atom<RequestingTree>((get) => {
+  const client = get(requestClientAtom);
+  invariant(client, "no requestClientAtom set");
+  return new RequestingTree({
+    getRoots: client.getFileRoots,
+    listFiles: client.sendListFiles,
+    createFileOrFolder: client.sendCreateFileOrFolder,
+    deleteFileOrFolder: client.sendDeleteFileOrFolder,
+    copyFileOrFolder: client.sendCopyFileOrFolder,
+    renameFileOrFolder: client.sendRenameFileOrFolder,
+  });
+});
+
+export const openStateAtom = atom<Record<string, boolean>>({});

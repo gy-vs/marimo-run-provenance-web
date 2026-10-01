@@ -1,0 +1,186 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+import { closeCompletion } from "@codemirror/autocomplete";
+import type { EditorState } from "@codemirror/state";
+import {
+  closeHoverTooltips,
+  type EditorView,
+  type KeyBinding,
+  keymap,
+} from "@codemirror/view";
+import type { CellId } from "@/core/cells/ids";
+import { hotkeysAtom, platformAtom } from "../../config/config";
+import { ensureCellEditorView } from "../../cells/cells";
+import { store } from "../../state/jotai";
+import { variablesAtom } from "../../variables/state";
+import type { VariableName, Variables } from "../../variables/types";
+import { getPositionAtWordBounds } from "../completion/hints";
+import { goToLine, goToVariableDefinition } from "./commands";
+
+function keymapBindingMatchesHotkey(
+  binding: KeyBinding,
+  hotkey: string,
+): boolean {
+  const platform = store.get(platformAtom);
+  const bindingKey =
+    platform === "mac"
+      ? (binding.mac ?? binding.key)
+      : platform === "windows"
+        ? (binding.win ?? binding.key)
+        : (binding.linux ?? binding.key);
+  return bindingKey === hotkey;
+}
+
+/**
+ * Get the word under the cursor.
+ */
+function getWordUnderCursor(state: EditorState) {
+  const { from, to } = state.selection.main;
+  if (from === to) {
+    const { startToken, endToken } = getPositionAtWordBounds(state.doc, from);
+    return {
+      position: startToken,
+      word: state.doc.sliceString(startToken, endToken),
+    };
+  }
+
+  return {
+    position: from,
+    word: state.doc.sliceString(from, to),
+  };
+}
+
+/**
+ * Get the cell id of the definition of the given variable.
+ */
+function getCellIdOfDefinition(
+  variables: Variables,
+  variableName: string,
+): CellId | null {
+  if (!variableName) {
+    return null;
+  }
+  const variable = variables[variableName as VariableName];
+  if (!variable || variable.declaredBy.length === 0) {
+    return null;
+  }
+  return variable.declaredBy[0];
+}
+
+function isPrivateVariable(variableName: string) {
+  return variableName.startsWith("_");
+}
+
+/**
+ * Go to the definition of the variable under the cursor.
+ * @param view The editor view at which the command was invoked.
+ */
+export function goToDefinitionAtCursorPosition(view: EditorView): boolean {
+  const { state } = view;
+  const { position, word } = getWordUnderCursor(state);
+  if (!word) {
+    return false;
+  }
+  // Close popovers/tooltips
+  closeCompletion(view);
+  view.dispatch({ effects: closeHoverTooltips });
+
+  return goToDefinition(view, word, position);
+}
+
+/**
+ * Invoke the editor's go-to-definition keymap handlers for the configured
+ * hotkey. Matches CodeMirror key strings directly (including customized
+ * shortcuts like `Ctrl-F12`) instead of synthesizing keyboard events.
+ */
+export function requestLspGoToDefinition(
+  view: EditorView,
+  hotkey = store.get(hotkeysAtom).getHotkey("cell.goToDefinition").key,
+): boolean {
+  for (const binding of view.state.facet(keymap).flat()) {
+    if (keymapBindingMatchesHotkey(binding, hotkey) && binding.run?.(view)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Go to the definition under the cursor, falling back to the language server
+ * when marimo cannot resolve the symbol (e.g. external library code).
+ */
+export function goToDefinitionWithLspFallback(view: EditorView): boolean {
+  if (goToDefinitionAtCursorPosition(view)) {
+    return true;
+  }
+  return requestLspGoToDefinition(view);
+}
+
+/**
+ * Go to the definition of the variable under the cursor.
+ * @param view The editor view at which the command was invoked.
+ */
+export function goToDefinition(
+  view: EditorView,
+  variableName: string,
+  usagePosition?: number,
+): boolean {
+  if (usagePosition !== undefined) {
+    const foundLocally = goToVariableDefinition(
+      view,
+      variableName,
+      usagePosition,
+    );
+    if (foundLocally) {
+      return true;
+    }
+  }
+
+  // The variable may exist in another cell
+  const editorWithVariable = getEditorForVariable(view, variableName);
+  if (!editorWithVariable) {
+    return false;
+  }
+  return goToVariableDefinition(editorWithVariable, variableName);
+}
+
+/**
+ * Go to the given line number in the cell with the given ID.
+ * @param cellId The ID of the cell to go to.
+ * @param line The line number to go to.
+ */
+export function goToCellLine(cellId: CellId, lineNumber: number): boolean {
+  const view = getEditorForCell(cellId);
+  if (!view) {
+    return false;
+  }
+  return goToLine(view, lineNumber);
+}
+
+/**
+ * @param editor The editor view at which the command was invoked.
+ * @param variableName  The name of the variable to go to.
+ */
+function getEditorForVariable(
+  editor: EditorView,
+  variableName: string,
+): EditorView | null {
+  // If it's a private variable, we only want to go to the
+  // definition if it's in the same cell
+  if (isPrivateVariable(variableName)) {
+    return editor;
+  }
+
+  const variables = store.get(variablesAtom);
+
+  const cellId = getCellIdOfDefinition(variables, variableName);
+  if (cellId) {
+    return getEditorForCell(cellId);
+  }
+
+  return null;
+}
+
+function getEditorForCell(cellId: CellId): EditorView | null {
+  return ensureCellEditorView(cellId) ?? null;
+}

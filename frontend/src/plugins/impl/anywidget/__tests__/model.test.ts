@@ -1,0 +1,354 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
+import { TestUtils } from "@/__tests__/test-helpers";
+import { getMarimoInternal, Model } from "../model";
+import { WidgetRegistry } from "../registry";
+import type { ModelState, WidgetModelId } from "../types";
+
+// Helper to create typed model IDs for tests
+const asModelId = (id: string): WidgetModelId => id as WidgetModelId;
+
+// Mock the request client
+const mockSendModelValue = vi.fn().mockResolvedValue(null);
+vi.mock("@/core/network/requests", () => ({
+  getRequestClient: () => ({
+    sendModelValue: mockSendModelValue,
+  }),
+}));
+
+// Mock isStaticNotebook — default to false (normal mode)
+const mockIsStatic = vi.fn().mockReturnValue(false);
+vi.mock("@/core/static/static-state", () => ({
+  isStaticNotebook: () => mockIsStatic(),
+}));
+
+// Helper to create a mock MarimoComm
+function createMockComm() {
+  return {
+    sendUpdate: vi.fn().mockResolvedValue(undefined),
+    sendCustomMessage: vi.fn().mockResolvedValue(undefined),
+  };
+}
+
+describe("Model", () => {
+  let model: Model<{ foo: string; bar: number }>;
+  let mockComm: ReturnType<typeof createMockComm>;
+
+  beforeEach(() => {
+    mockComm = createMockComm();
+    mockSendModelValue.mockClear();
+    model = new Model({ foo: "test", bar: 123 }, mockComm);
+  });
+
+  describe("public API", () => {
+    it("should only expose AFM-compliant interface", () => {
+      // Get all enumerable own properties
+      const ownProperties = Object.keys(model).toSorted();
+      // Get prototype methods (excluding constructor)
+      const prototypeMethods = Object.getOwnPropertyNames(
+        Object.getPrototypeOf(model),
+      )
+        .filter((name) => name !== "constructor")
+        .toSorted();
+
+      // Snapshot the public API to catch accidental leaks of internal methods
+      expect({ ownProperties, prototypeMethods }).toMatchInlineSnapshot(`
+        {
+          "ownProperties": [
+            "widget_manager",
+          ],
+          "prototypeMethods": [
+            "get",
+            "off",
+            "on",
+            "save_changes",
+            "send",
+            "set",
+          ],
+        }
+      `);
+    });
+  });
+
+  describe("get/set", () => {
+    it("should get values correctly", () => {
+      expect(model.get("foo")).toBe("test");
+      expect(model.get("bar")).toBe(123);
+    });
+
+    it("should set values and emit change events", () => {
+      const callback = vi.fn();
+      model.on("change:foo", callback);
+      model.set("foo", "new value");
+
+      expect(callback).toHaveBeenCalledWith("new value");
+      expect(model.get("foo")).toBe("new value");
+    });
+
+    it("should not emit change events for non-subscribed fields", () => {
+      const callback = vi.fn();
+      model.on("change:foo", callback);
+      model.set("bar", 456);
+
+      expect(callback).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("save_changes", () => {
+    it("should only save dirty fields", () => {
+      model.set("foo", "new value");
+      model.set("bar", 456);
+      model.save_changes();
+
+      expect(mockComm.sendUpdate).toHaveBeenCalledWith({
+        foo: "new value",
+        bar: 456,
+      });
+    });
+
+    it("should clear dirty fields after save", () => {
+      model.set("foo", "new value");
+      model.save_changes();
+
+      expect(mockComm.sendUpdate).toHaveBeenCalledWith({
+        foo: "new value",
+      });
+
+      model.set("bar", 456);
+      model.save_changes();
+
+      // After clearing, only the newly changed field is sent
+      expect(mockComm.sendUpdate).toHaveBeenCalledWith({
+        bar: 456,
+      });
+    });
+
+    it("should not call sendUpdate when no dirty fields", () => {
+      model.set("foo", "new value");
+      model.save_changes();
+      model.save_changes(); // Second save should not call sendUpdate
+
+      expect(mockComm.sendUpdate).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("event handling", () => {
+    it("should add and remove event listeners", () => {
+      const callback = vi.fn();
+      model.on("change:foo", callback);
+      model.set("foo", "new value");
+      expect(callback).toHaveBeenCalledTimes(1);
+
+      model.off("change:foo", callback);
+      model.set("foo", "another value");
+      expect(callback).toHaveBeenCalledTimes(1);
+    });
+
+    it("should remove all listeners when no event name provided", () => {
+      const callback1 = vi.fn();
+      const callback2 = vi.fn();
+      model.on("change:foo", callback1);
+      model.on("change:bar", callback2);
+
+      model.off();
+      model.set("foo", "new value");
+      model.set("bar", 456);
+
+      expect(callback1).not.toHaveBeenCalled();
+      expect(callback2).not.toHaveBeenCalled();
+    });
+
+    it("should remove all listeners for specific event", () => {
+      const callback1 = vi.fn();
+      const callback2 = vi.fn();
+      model.on("change:foo", callback1);
+      model.on("change:foo", callback2);
+
+      model.off("change:foo");
+      model.set("foo", "new value");
+
+      expect(callback1).not.toHaveBeenCalled();
+      expect(callback2).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("send", () => {
+    it("should send message and handle callbacks", async () => {
+      const callback = vi.fn();
+      await model.send({ test: true }, callback);
+
+      expect(mockComm.sendCustomMessage).toHaveBeenCalledWith(
+        { test: true },
+        [],
+      );
+      expect(callback).toHaveBeenCalled();
+    });
+
+    it("should convert buffers to DataViews", async () => {
+      const buffer = new ArrayBuffer(8);
+      await model.send({ test: true }, undefined, [buffer]);
+
+      expect(mockComm.sendCustomMessage).toHaveBeenCalledWith({ test: true }, [
+        expect.any(DataView),
+      ]);
+    });
+  });
+
+  describe("widget_manager", () => {
+    const childModelId = asModelId("test-id");
+    const childModel = new Model<ModelState>({ foo: "test" }, createMockComm());
+    const manager = new WidgetRegistry(10);
+    let previousModelManager = Model._modelManager;
+
+    beforeAll(() => {
+      previousModelManager = Model._modelManager;
+      manager.setModel(childModelId, childModel);
+      Model._modelManager = manager;
+    });
+
+    afterAll(() => {
+      manager.delete(childModelId);
+      Model._modelManager = previousModelManager;
+    });
+
+    it("should throw error when accessing a model that is not registered", async () => {
+      await expect(
+        model.widget_manager.get_model(asModelId("random-id")),
+      ).rejects.toThrow("Model not found for key: random-id");
+    });
+
+    it("should return the registered model", async () => {
+      expect(await model.widget_manager.get_model(childModelId)).toBe(
+        childModel,
+      );
+    });
+  });
+
+  describe("updateAndEmitDiffs", () => {
+    it("should only update and emit for changed values", () => {
+      const callback = vi.fn();
+      model.on("change:foo", callback);
+
+      getMarimoInternal(model).updateAndEmitDiffs({ foo: "test", bar: 456 });
+      expect(callback).not.toHaveBeenCalled(); // foo didn't change
+      expect(model.get("bar")).toBe(456);
+    });
+
+    it("should update and emit for deep changes", () => {
+      const modelWithObject = new Model<{ foo: { nested: string } }>(
+        { foo: { nested: "test" } },
+        createMockComm(),
+      );
+      const callback = vi.fn();
+      modelWithObject.on("change:foo", callback);
+
+      getMarimoInternal(modelWithObject).updateAndEmitDiffs({
+        foo: { nested: "changed" },
+      });
+      expect(callback).toHaveBeenCalledTimes(1);
+    });
+
+    it("should emit change event for any changes", async () => {
+      const callback = vi.fn();
+      model.on("change", callback);
+      getMarimoInternal(model).updateAndEmitDiffs({ foo: "changed", bar: 456 });
+      await TestUtils.nextTick(); // flush
+      expect(callback).toHaveBeenCalledTimes(1);
+    });
+
+    it("should not mark kernel-pushed state dirty", () => {
+      getMarimoInternal(model).updateAndEmitDiffs({ foo: "changed", bar: 456 });
+
+      model.save_changes();
+      expect(mockComm.sendUpdate).not.toHaveBeenCalled();
+    });
+
+    it("should not echo kernel-pushed state alongside a local set", () => {
+      // Kernel pushes a large trait; widget ESM then sets one field.
+      getMarimoInternal(model).updateAndEmitDiffs({
+        foo: "from kernel",
+        bar: 123,
+      });
+      model.set("bar", 456);
+
+      model.save_changes();
+      expect(mockComm.sendUpdate).toHaveBeenCalledExactlyOnceWith({
+        bar: 456,
+      });
+    });
+
+    it("should drop a pending local write superseded by a kernel push", () => {
+      // Local write, not yet saved...
+      model.set("foo", "local");
+      // ...then the kernel pushes a newer value for the same key.
+      getMarimoInternal(model).updateAndEmitDiffs({
+        foo: "from kernel",
+        bar: 123,
+      });
+      expect(model.get("foo")).toBe("from kernel");
+
+      // Saving must not resend the stale local value.
+      model.save_changes();
+      expect(mockComm.sendUpdate).not.toHaveBeenCalled();
+    });
+
+    it("should drop a pending local write the kernel pushed the same value for", () => {
+      const callback = vi.fn();
+      model.on("change:foo", callback);
+
+      // Local write, not yet saved...
+      model.set("foo", "agreed");
+      expect(callback).toHaveBeenCalledTimes(1);
+
+      // ...then the kernel independently pushes the same value.
+      getMarimoInternal(model).updateAndEmitDiffs({
+        foo: "agreed",
+        bar: 123,
+      });
+      expect(callback).toHaveBeenCalledTimes(1); // no spurious re-emit
+
+      model.save_changes();
+      expect(mockComm.sendUpdate).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("emitCustomMessage", () => {
+    it("should handle custom messages", () => {
+      const callback = vi.fn();
+      model.on("msg:custom", callback);
+
+      const content = { type: "test" };
+      getMarimoInternal(model).emitCustomMessage({
+        method: "custom",
+        content,
+      });
+
+      expect(callback).toHaveBeenCalledWith(content, []);
+    });
+
+    it("should handle custom messages with buffers", () => {
+      const callback = vi.fn();
+      model.on("msg:custom", callback);
+
+      const content = { type: "test" };
+      const buffer = new DataView(new ArrayBuffer(8));
+      getMarimoInternal(model).emitCustomMessage(
+        {
+          method: "custom",
+          content,
+        },
+        [buffer],
+      );
+
+      expect(callback).toHaveBeenCalledWith(content, [buffer]);
+    });
+  });
+});

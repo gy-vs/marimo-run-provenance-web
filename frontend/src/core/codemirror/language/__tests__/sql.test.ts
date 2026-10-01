@@ -1,0 +1,3022 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+import { CompletionContext } from "@codemirror/autocomplete";
+import type { CompletionSource } from "@codemirror/autocomplete";
+import { PostgreSQL, sql } from "@codemirror/lang-sql";
+import { forEachDiagnostic, forceLinting } from "@codemirror/lint";
+import { EditorState, type Extension } from "@codemirror/state";
+import { EditorView } from "@codemirror/view";
+import { DuckDBDialect } from "@marimo-team/codemirror-sql/dialects";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { CellId } from "@/core/cells/ids";
+import type {
+  CompletionConfig,
+  DiagnosticsConfig,
+  LSPConfig,
+} from "@/core/config/config-schema";
+import type { DataSourceConnection } from "@/core/datasets/data-source-connections";
+import {
+  dataSourceConnectionsAtom,
+  exportedForTesting as dataSourceTesting,
+  setLatestEngineSelected,
+} from "@/core/datasets/data-source-connections";
+import { type ConnectionName, DUCKDB_ENGINE } from "@/core/datasets/engines";
+import { ValidateSQL } from "@/core/datasets/request-registry";
+import { datasetsAtom } from "@/core/datasets/state";
+import type { DatasetsState } from "@/core/datasets/types";
+import type { HotkeyProvider } from "@/core/hotkeys/hotkeys";
+import { store } from "@/core/state/jotai";
+import type { PlaceholderType } from "../../config/types";
+import { TestSQLCompletionStore } from "../languages/sql/completion-store";
+import * as sqlMode from "../languages/sql/sql-mode";
+import {
+  exportedForTesting,
+  SQLLanguageAdapter,
+  type SQLLanguageAdapterMetadata,
+} from "../languages/sql/sql";
+import { languageMetadataField, updateLanguageMetadata } from "../metadata";
+
+const adapter = new SQLLanguageAdapter();
+
+const TEST_ENGINE = "test_engine" as ConnectionName;
+
+const TEST_EXTENSION_ARGS = [
+  {} as CellId,
+  {} as CompletionConfig,
+  {} as HotkeyProvider,
+  {} as PlaceholderType,
+  {} as LSPConfig & {
+    diagnostics: DiagnosticsConfig;
+  },
+] as const;
+
+describe("SQLLanguageAdapter", () => {
+  describe("defaultMetadata", () => {
+    it("should be set", () => {
+      expect(adapter.defaultMetadata).toMatchInlineSnapshot(`
+        {
+          "commentLines": [],
+          "dataframeName": "_df",
+          "engine": "${DUCKDB_ENGINE}",
+          "quotePrefix": "f",
+          "showOutput": true,
+        }
+      `);
+    });
+  });
+
+  describe("transformIn", () => {
+    it("empty", () => {
+      const [innerCode, offset, metadata] = adapter.transformIn("");
+      expect(innerCode).toBe("");
+      expect(offset).toBe(0);
+      const out = adapter.transformOut(innerCode, metadata);
+      expect(out).toMatchInlineSnapshot(`
+        [
+          "_df = mo.sql(
+            f"""
+
+            """
+        )",
+          24,
+        ]
+      `);
+    });
+
+    it("should extract inner SQL from triple double-quoted strings", () => {
+      const pythonCode = '_df = mo.sql("""SELECT * FROM {df}""")';
+      const [innerCode, offset, metadata] = adapter.transformIn(pythonCode);
+      expect(innerCode).toBe("SELECT * FROM {df}");
+      expect(metadata.dataframeName).toBe("_df");
+      expect(offset).toBe(16);
+    });
+
+    it("should handle single double-quoted strings", () => {
+      const pythonCode = 'next_df = mo.sql("SELECT * FROM {df}")';
+      const [innerCode, offset, metadata] = adapter.transformIn(pythonCode);
+      expect(innerCode).toBe("SELECT * FROM {df}");
+      expect(metadata.dataframeName).toBe("next_df");
+      expect(offset).toBe(18);
+    });
+
+    it("should handle triple single-quoted strings", () => {
+      const pythonCode = "next_df = mo.sql('''SELECT * \nFROM {df}''')";
+      const [innerCode, offset] = adapter.transformIn(pythonCode);
+      expect(innerCode).toBe("SELECT * \nFROM {df}");
+      expect(offset).toBe(20);
+    });
+
+    it("should return as is if not sql", () => {
+      const pythonCode = 'next_df = print("Hello, World!")';
+      const [innerCode, offset] = adapter.transformIn(pythonCode);
+      expect(innerCode).toBe('next_df = print("Hello, World!")');
+      expect(offset).toBe(0);
+    });
+
+    it("should handle an empty string", () => {
+      const pythonCode = 'next_df = mo.sql("")';
+      const [innerCode, offset] = adapter.transformIn(pythonCode);
+      expect(innerCode).toBe("");
+      expect(offset).toBe(18);
+    });
+
+    it("simple sql", () => {
+      const pythonCode = 'next_df = mo.sql("SELECT * FROM {df}")';
+      const [innerCode, offset] = adapter.transformIn(pythonCode);
+      expect(innerCode).toBe("SELECT * FROM {df}");
+      expect(offset).toBe(18);
+    });
+
+    it("should trim strings with leading and trailing whitespace", () => {
+      const pythonCode = 'next_df = mo.sql("""   \nSELECT * FROM {df}\n   """)';
+      const [innerCode, offset] = adapter.transformIn(pythonCode);
+      expect(innerCode).toBe("SELECT * FROM {df}");
+      expect(offset).toBe(20);
+    });
+
+    it("should handle space around the f-strings", () => {
+      const pythonCode = 'next_df = mo.sql(\n\t"""\nSELECT * FROM {df}\n"""\n)';
+      const [innerCode, offset] = adapter.transformIn(pythonCode);
+      expect(innerCode).toBe("SELECT * FROM {df}");
+      expect(offset).toBe(22);
+    });
+
+    it("should handle output flag set to True", () => {
+      const pythonCode = '_df = mo.sql("""SELECT * FROM table""", output=True)';
+      const [innerCode, offset, metadata] = adapter.transformIn(pythonCode);
+      expect(innerCode).toBe("SELECT * FROM table");
+      expect(metadata.showOutput).toBe(true);
+      expect(offset).toBe(16);
+    });
+
+    it("should handle output flag set to False", () => {
+      const pythonCode =
+        '_df = mo.sql("""SELECT * FROM table""", output=False)';
+      const [innerCode, offset, metadata] = adapter.transformIn(pythonCode);
+      expect(innerCode).toBe("SELECT * FROM table");
+      expect(metadata.showOutput).toBe(false);
+      expect(offset).toBe(16);
+
+      // handle trailing comma
+      const pythonCode2 =
+        '_df = mo.sql("""SELECT * FROM table""", output=False,)';
+      const [innerCode2, offset2, metadata2] = adapter.transformIn(pythonCode2);
+      expect(innerCode2).toBe("SELECT * FROM table");
+      expect(metadata2.showOutput).toBe(false);
+      expect(offset2).toBe(16);
+    });
+
+    it("should default to showing output when flag is not specified", () => {
+      const pythonCode = '_df = mo.sql("""SELECT * FROM table""")';
+      const [innerCode, offset, metadata] = adapter.transformIn(pythonCode);
+      expect(innerCode).toBe("SELECT * FROM table");
+      expect(metadata.showOutput).toBe(true);
+      expect(offset).toBe(16);
+    });
+
+    it("should handle engine param when provided", () => {
+      const pythonCode =
+        '_df = mo.sql("""SELECT * FROM table""", engine=postgres_engine)';
+      const [innerCode, offset, metadata] = adapter.transformIn(pythonCode);
+      expect(innerCode).toBe("SELECT * FROM table");
+      expect(offset).toBe(16);
+      expect(metadata.engine).toBe("postgres_engine");
+
+      // handle trailing comma
+      const pythonCode2 =
+        '_df = mo.sql("""SELECT * FROM table""", engine=postgres_engine,)';
+      const [innerCode2, offset2, metadata2] = adapter.transformIn(pythonCode2);
+      expect(innerCode2).toBe("SELECT * FROM table");
+      expect(offset2).toBe(16);
+      expect(metadata2.engine).toBe("postgres_engine");
+    });
+
+    it("should handle engine param with output flag", () => {
+      const pythonCode =
+        '_df = mo.sql("""SELECT * FROM table""", output=False, engine=postgres_engine)';
+      const [innerCode, offset, metadata] = adapter.transformIn(pythonCode);
+      expect(innerCode).toBe("SELECT * FROM table");
+      expect(offset).toBe(16);
+      expect(metadata.showOutput).toBe(false);
+      expect(metadata.engine).toBe("postgres_engine");
+    });
+
+    it("should handle reversed order of params", () => {
+      const pythonCode =
+        '_df = mo.sql("""SELECT * FROM table""", engine=postgres_engine, output=False)';
+      const [innerCode, offset, metadata] = adapter.transformIn(pythonCode);
+      expect(innerCode).toBe("SELECT * FROM table");
+      expect(offset).toBe(16);
+      expect(metadata.showOutput).toBe(false);
+      expect(metadata.engine).toBe("postgres_engine");
+    });
+
+    it("should handle parametrized sql", () => {
+      const pythonCode = `
+_df = mo.sql(
+    f"""
+    SELECT name, price, category
+    FROM products
+    WHERE price < {price_threshold.value}
+    ORDER BY price DESC
+    """,
+    engine=sqlite,
+)
+`;
+      const [innerCode, offset, metadata] = adapter.transformIn(pythonCode);
+      expect(innerCode).toBe(
+        `
+SELECT name, price, category
+FROM products
+WHERE price < {price_threshold.value}
+ORDER BY price DESC
+        `.trim(),
+      );
+      expect(offset).toBe(22);
+      expect(metadata.showOutput).toBe(true);
+      expect(metadata.engine).toBe("sqlite");
+    });
+
+    it("should handle parametrized sql with triple single quotes f-string", () => {
+      const pythonCode = `
+_df = mo.sql(
+    f'''
+    SELECT name, price, category
+    FROM products
+    WHERE price < {price_threshold.value}
+    ORDER BY price DESC
+    ''',
+    engine=sqlite,
+)
+`;
+      const [innerCode, offset, metadata] = adapter.transformIn(pythonCode);
+      expect(innerCode).toBe(
+        `
+SELECT name, price, category
+FROM products
+WHERE price < {price_threshold.value}
+ORDER BY price DESC
+        `.trim(),
+      );
+      expect(offset).toBe(22);
+      expect(metadata.engine).toBe("sqlite");
+    });
+
+    it("should handle parametrized sql with inline double quotes f-string", () => {
+      const pythonCode = `
+_df = mo.sql(
+    f"FROM products WHERE price < {price_threshold.value}",
+    engine=sqlite,
+)
+`;
+      const [innerCode, offset, metadata] = adapter.transformIn(pythonCode);
+      expect(innerCode).toBe(
+        "FROM products WHERE price < {price_threshold.value}",
+      );
+      expect(offset).toBe(20);
+      expect(metadata.engine).toBe("sqlite");
+    });
+
+    it("should handle parametrized sql with inline single quotes f-string", () => {
+      const pythonCode = `
+_df = mo.sql(
+    f"FROM products WHERE price < {price_threshold.value}",
+    engine=sqlite,
+)
+`;
+      const [innerCode, offset, metadata] = adapter.transformIn(pythonCode);
+      expect(innerCode).toBe(
+        "FROM products WHERE price < {price_threshold.value}",
+      );
+      expect(offset).toBe(20);
+      expect(metadata.engine).toBe("sqlite");
+    });
+  });
+
+  describe("transformOut", () => {
+    let metadata: SQLLanguageAdapterMetadata;
+
+    beforeEach(() => {
+      metadata = {
+        engine: DUCKDB_ENGINE,
+        showOutput: true,
+        dataframeName: "_df",
+        quotePrefix: "f",
+        commentLines: [],
+      };
+    });
+
+    it("should wrap SQL code with triple double-quoted string format", () => {
+      const code = "SELECT * FROM {df}";
+      metadata.quotePrefix = "f";
+      metadata.dataframeName = "my_df";
+      const [wrappedCode, offset] = adapter.transformOut(code, metadata);
+      expect(wrappedCode).toMatchInlineSnapshot(`
+        "my_df = mo.sql(
+            f"""
+            SELECT * FROM {df}
+            """
+        )"
+      `);
+      expect(offset).toBe(26);
+    });
+
+    it("should include output flag when set to False", () => {
+      const code = "SELECT * FROM table";
+      metadata.quotePrefix = "f";
+      metadata.dataframeName = "my_df";
+      metadata.showOutput = false;
+      const [wrappedCode, offset] = adapter.transformOut(code, metadata);
+      expect(wrappedCode).toMatchInlineSnapshot(`
+        "my_df = mo.sql(
+            f"""
+            SELECT * FROM table
+            """,
+            output=False
+        )"
+      `);
+      expect(offset).toBe(26);
+    });
+
+    it("should not include output flag when set to True", () => {
+      const code = "SELECT * FROM table";
+      metadata.quotePrefix = "f";
+      metadata.dataframeName = "my_df";
+      metadata.showOutput = true;
+      const [wrappedCode, offset] = adapter.transformOut(code, metadata);
+      expect(wrappedCode).toMatchInlineSnapshot(`
+        "my_df = mo.sql(
+            f"""
+            SELECT * FROM table
+            """
+        )"
+      `);
+      expect(offset).toBe(26);
+    });
+
+    it("should preserve Python comments", () => {
+      const pythonCode = '# hello\nmy_df = mo.sql("""SELECT * FROM {df}""")';
+      const [innerCode, , metadata] = adapter.transformIn(pythonCode);
+      expect(innerCode).toBe("SELECT * FROM {df}");
+      const [wrappedCode, offset] = adapter.transformOut(innerCode, metadata);
+      expect(wrappedCode).toMatchInlineSnapshot(`
+        "# hello
+        my_df = mo.sql(
+            f"""
+            SELECT * FROM {df}
+            """
+        )"
+      `);
+      expect(offset).toBe(26);
+    });
+
+    it("should add engine connection when provided", () => {
+      const code = "SELECT * FROM table";
+      metadata.engine = "postgres_engine" as ConnectionName;
+      metadata.commentLines = ["# hello"];
+      const [wrappedCode, offset] = adapter.transformOut(code, metadata);
+      expect(wrappedCode).toMatchInlineSnapshot(`
+        "# hello
+        _df = mo.sql(
+            f"""
+            SELECT * FROM table
+            """,
+            engine=postgres_engine
+        )"
+      `);
+      expect(offset).toBe(24);
+    });
+
+    it("should add engine connection and output flag when provided", () => {
+      const code = "SELECT * FROM table";
+      metadata.showOutput = false;
+      metadata.engine = "postgres_engine" as ConnectionName;
+      metadata.commentLines = ["# hello"];
+      const [wrappedCode, offset] = adapter.transformOut(code, metadata);
+      expect(wrappedCode).toMatchInlineSnapshot(`
+        "# hello
+        _df = mo.sql(
+            f"""
+            SELECT * FROM table
+            """,
+            output=False,
+            engine=postgres_engine
+        )"
+      `);
+      expect(offset).toBe(24);
+    });
+  });
+
+  describe("isSupported", () => {
+    it("should return true for supported sql string formats", () => {
+      expect(
+        adapter.isSupported('df2 = mo.sql("""SELECT * FROM {df}""")'),
+      ).toBe(true);
+      expect(adapter.isSupported("my_df = mo.sql('')")).toBe(true);
+      expect(adapter.isSupported('df = mo.sql("")')).toBe(true);
+      expect(adapter.isSupported('# this is a sql cell\ndf = mo.sql("")')).toBe(
+        true,
+      );
+      expect(
+        adapter.isSupported(
+          '# this is a sql cell\n# with multiple comments\ndf = mo.sql("")',
+        ),
+      ).toBe(true);
+      expect(adapter.isSupported(new SQLLanguageAdapter().defaultCode)).toBe(
+        true,
+      );
+    });
+
+    it("should return false for unsupported string formats", () => {
+      expect(adapter.isSupported('print("Hello, World!")')).toBe(false);
+      expect(adapter.isSupported("mo.sql()")).toBe(false);
+      expect(adapter.isSupported("mo.sql('')")).toBe(false);
+      expect(adapter.isSupported('mo.sql("")')).toBe(false);
+      expect(adapter.isSupported("_df = mo.sql()")).toBe(false);
+      expect(adapter.isSupported('df := mo.sql("")')).toBe(false);
+    });
+
+    it("should return false sequences that look like sql but are not", () => {
+      const once = 'df = mo.sql("""SELECT * FROM {df}""")';
+      const pythonCode = [once, once].join("\n");
+      expect(adapter.isSupported(pythonCode)).toBe(false);
+    });
+
+    it("should return false when there are multiple sql strings", () => {
+      const pythonCode = `
+      _df = mo.sql("""SELECT * FROM table1""")
+      _df2 = mo.sql("""SELECT * FROM table2""")
+      `;
+      expect(adapter.isSupported(pythonCode)).toBe(false);
+    });
+
+    it("should return false when there are non sql strings with sql string", () => {
+      const pythonCode = `print("Hello, World!") \n_df = mo.sql("SELECT * FROM table")`;
+      expect(adapter.isSupported(pythonCode)).toBe(false);
+
+      const pythonCode2 = `_df = mo.sql("""SELECT * FROM table""") \n print("Hello, World!")`;
+      expect(adapter.isSupported(pythonCode2)).toBe(false);
+    });
+
+    it("should return true for sql strings with whitespace before or after", () => {
+      expect(
+        adapter.isSupported(' df = mo.sql("""SELECT * FROM table""")'),
+      ).toBe(true);
+      expect(
+        adapter.isSupported('df = mo.sql("""SELECT * FROM table""") '),
+      ).toBe(true);
+    });
+
+    it("should support SQL strings with output flag", () => {
+      expect(
+        adapter.isSupported(
+          'df = mo.sql("""SELECT * FROM table""", output=True)',
+        ),
+      ).toBe(true);
+      expect(
+        adapter.isSupported(
+          'df = mo.sql("""SELECT * FROM table""", output=False)',
+        ),
+      ).toBe(true);
+    });
+
+    it("should support SQL strings with output flag multi-line", () => {
+      expect(
+        adapter.isSupported(
+          `
+        countries = mo.sql(
+            f"""
+            SELECT * from "https://raw.githubusercontent.com/data.csv"
+            """,
+            output=False
+        )`.trim(),
+        ),
+      ).toBe(true);
+      expect(
+        adapter.isSupported(
+          `
+        countries = mo.sql(
+            f"""
+            SELECT * from "https://raw.githubusercontent.com/data.csv"
+            """,
+            output=False,
+        )`.trim(),
+        ),
+      ).toBe(true);
+      expect(
+        adapter.isSupported(
+          `
+        countries = mo.sql(
+            f"""
+            SELECT * from "https://raw.githubusercontent.com/data.csv"
+            """,
+            output=False)`.trim(),
+        ),
+      ).toBe(true);
+    });
+  });
+
+  describe("latestEngineSelected", () => {
+    afterEach(() => {
+      const state = store.get(dataSourceConnectionsAtom);
+      const connections = new Map(state.connectionsMap);
+      connections
+        .set("postgres_engine" as ConnectionName, {
+          name: "postgres_engine" as ConnectionName,
+          source: "postgres",
+          display_name: "PostgreSQL",
+          dialect: "postgres",
+          databases: [],
+        })
+        .set("mysql_engine" as ConnectionName, {
+          name: "mysql_engine" as ConnectionName,
+          source: "mysql",
+          display_name: "MySQL",
+          dialect: "mysql",
+          databases: [],
+        })
+        .set(DUCKDB_ENGINE, {
+          name: DUCKDB_ENGINE,
+          source: "duckdb",
+          display_name: "DuckDB",
+          dialect: "duckdb",
+          databases: [],
+        });
+      store.set(dataSourceConnectionsAtom, {
+        ...state,
+        connectionsMap: connections,
+      });
+    });
+
+    const getLatestEngine = () =>
+      store.get(dataSourceConnectionsAtom).latestEngineSelected;
+
+    it("should have no selected engine initially", () => {
+      expect(getLatestEngine()).toBeNull();
+    });
+
+    it("should persist the selected engine", () => {
+      const engine = "mysql_engine" as ConnectionName;
+      setLatestEngineSelected(engine);
+      expect(getLatestEngine()).toBe(engine);
+
+      setLatestEngineSelected("postgres_engine" as ConnectionName);
+      expect(getLatestEngine()).toBe("postgres_engine");
+    });
+
+    it("should not change when engine is not in connectionsMap", () => {
+      const engine = "unknown_engine" as ConnectionName;
+      setLatestEngineSelected(engine);
+      expect(getLatestEngine()).not.toBe("unknown_engine");
+    });
+
+    it("should update engine in transformIn when specified", () => {
+      const pythonCode = '_df = mo.sql("""SELECT 1""", engine=postgres_engine)';
+      const metadata = adapter.transformIn(pythonCode)[2];
+      expect(metadata.engine).toBe("postgres_engine");
+      expect(getLatestEngine()).toBe("postgres_engine");
+
+      // Don't update for unspecified engine
+      const pythonCode2 = '_df = mo.sql("""SELECT 1""")';
+      const metadata2 = adapter.transformIn(pythonCode2)[2];
+      expect(metadata2.engine).toBe(DUCKDB_ENGINE);
+      expect(getLatestEngine()).toBe("postgres_engine");
+
+      // Don't update for unknown engine
+      const pythonCode3 = '_df = mo.sql("""SELECT 1""", engine=unknown_engine)';
+      const metadata3 = adapter.transformIn(pythonCode3)[2];
+      expect(metadata3.engine).toBe("unknown_engine");
+      expect(getLatestEngine()).toBe("postgres_engine");
+    });
+
+    it("should maintain engine selection across transformIn/transformOut", () => {
+      const engine = "postgres_engine" as ConnectionName;
+      setLatestEngineSelected(engine);
+
+      const [innerCode, , metadata] = adapter.transformIn(
+        `_df = mo.sql("""SELECT 1""", engine=${engine})`,
+      );
+      expect(metadata.engine).toBe(engine);
+
+      const [outCode] = adapter.transformOut(innerCode, metadata);
+      expect(outCode).toContain(`engine=${engine}`);
+    });
+
+    it("should maintain engine when transforming empty string", () => {
+      const engine = "postgres_engine" as ConnectionName;
+      setLatestEngineSelected(engine);
+
+      const [innerCode, , metadata] = adapter.transformIn("");
+      expect(metadata.engine).toBe(engine);
+
+      const [outCode] = adapter.transformOut(innerCode, metadata);
+      expect(outCode).toContain(`engine=${engine}`);
+    });
+
+    it("should restore previous engine when selecting default", () => {
+      const engine = "postgres_engine" as ConnectionName;
+      setLatestEngineSelected(engine);
+      setLatestEngineSelected(DUCKDB_ENGINE);
+
+      expect(getLatestEngine()).toBe(DUCKDB_ENGINE);
+    });
+  });
+
+  describe("defaultCode", () => {
+    it("should prefer the newest usable connection until an engine is selected", () => {
+      const previousState = store.get(dataSourceConnectionsAtom);
+      const connection: DataSourceConnection = {
+        name: "first_connection" as ConnectionName,
+        source: "sqlite",
+        display_name: "SQLite",
+        dialect: "sqlite",
+        databases: [],
+      };
+      const newestConnection = {
+        ...connection,
+        name: "newest_connection" as ConnectionName,
+      };
+      const icebergConnection = {
+        ...connection,
+        name: "catalog" as ConnectionName,
+        source: "iceberg",
+      };
+      try {
+        store.set(dataSourceConnectionsAtom, {
+          latestEngineSelected: null,
+          connectionsMap: new Map(),
+        });
+        expect(adapter.defaultMetadata.engine).toBe(DUCKDB_ENGINE);
+        expect(adapter.defaultCode).toBe('_df = mo.sql(f"""SELECT * FROM """)');
+
+        store.set(dataSourceConnectionsAtom, {
+          latestEngineSelected: null,
+          connectionsMap: new Map([
+            [connection.name, connection],
+            [newestConnection.name, newestConnection],
+            [icebergConnection.name, icebergConnection],
+            [DUCKDB_ENGINE, { ...connection, name: DUCKDB_ENGINE }],
+          ]),
+        });
+        expect(adapter.defaultMetadata.engine).toBe(newestConnection.name);
+        expect(adapter.defaultCode).toContain("engine=newest_connection");
+        expect(
+          store.get(dataSourceConnectionsAtom).latestEngineSelected,
+        ).toBeNull();
+
+        const refreshConnection = (connection: DataSourceConnection) => {
+          store.set(
+            dataSourceConnectionsAtom,
+            dataSourceTesting.reducer(store.get(dataSourceConnectionsAtom), {
+              type: "addDataSourceConnection",
+              payload: { connections: [connection] },
+            }),
+          );
+        };
+        refreshConnection(connection);
+        expect(adapter.defaultMetadata.engine).toBe(connection.name);
+        expect(adapter.defaultCode).toContain("engine=first_connection");
+
+        setLatestEngineSelected(connection.name);
+        refreshConnection(newestConnection);
+        expect(adapter.defaultCode).toContain("engine=first_connection");
+
+        setLatestEngineSelected(DUCKDB_ENGINE);
+        refreshConnection(connection);
+        expect(adapter.defaultMetadata.engine).toBe(DUCKDB_ENGINE);
+        expect(adapter.defaultCode).toBe('_df = mo.sql(f"""SELECT * FROM """)');
+      } finally {
+        store.set(dataSourceConnectionsAtom, previousState);
+      }
+    });
+
+    it("should include engine in defaultCode when selected", () => {
+      const engine = "postgres_engine" as ConnectionName;
+      setLatestEngineSelected(engine);
+      expect(adapter.defaultCode).toBe(
+        `_df = mo.sql(f"""SELECT * FROM """, engine=${engine})`,
+      );
+    });
+
+    it("should not include engine in defaultCode when using default engine", () => {
+      setLatestEngineSelected(DUCKDB_ENGINE);
+      expect(adapter.defaultCode).toBe(`_df = mo.sql(f"""SELECT * FROM """)`);
+    });
+  });
+});
+
+describe("SQL analysis features", () => {
+  const metadata: SQLLanguageAdapterMetadata = {
+    dataframeName: "_df",
+    quotePrefix: "f",
+    commentLines: [],
+    showOutput: true,
+    engine: TEST_ENGINE,
+  };
+
+  const createConnection = (
+    columns: string[],
+    includeDefaultSchema = true,
+  ): DataSourceConnection => ({
+    name: TEST_ENGINE,
+    dialect: "postgres",
+    display_name: "PostgreSQL",
+    source: "postgres",
+    default_database: "test_db",
+    default_schema: includeDefaultSchema ? "public" : undefined,
+    databases: [
+      {
+        name: "test_db",
+        dialect: "postgres",
+        schemas: [
+          {
+            name: "public",
+            tables: [
+              {
+                name: "users",
+                source: "postgres",
+                source_type: "local",
+                type: "table",
+                num_columns: columns.length,
+                num_rows: 0,
+                variable_name: null,
+                columns: columns.map((name) => ({
+                  name,
+                  external_type: "string",
+                  type: "string",
+                  sample_values: [],
+                })),
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  });
+
+  const createCompletionContext = (doc: string, pos: number) => {
+    const state = EditorState.create({
+      doc,
+      extensions: [languageMetadataField.init(() => metadata)],
+    });
+    const view = new EditorView({ state });
+    return {
+      context: new CompletionContext(view.state, pos, true, view),
+      view,
+    };
+  };
+
+  const getLabels = async (
+    source: CompletionSource,
+    context: CompletionContext,
+  ) => {
+    const result = await source(context);
+    return result?.options.map((option) => option.label) ?? [];
+  };
+
+  beforeEach(() => {
+    store.set(datasetsAtom, { tables: [] } as unknown as DatasetsState);
+    store.set(dataSourceConnectionsAtom, {
+      connectionsMap: new Map([
+        [TEST_ENGINE, createConnection(["id", "name"])],
+      ]),
+      latestEngineSelected: TEST_ENGINE,
+    });
+  });
+
+  it("resolves alias completions from the latest connection schema", async () => {
+    const analysis = exportedForTesting.createSQLAnalysis();
+    const doc = "SELECT u. FROM users u";
+    const { context, view } = createCompletionContext(doc, "SELECT u.".length);
+
+    expect(await getLabels(analysis.aliasCompletionSource, context)).toEqual(
+      expect.arrayContaining(["id", "name"]),
+    );
+
+    store.set(dataSourceConnectionsAtom, {
+      connectionsMap: new Map([
+        [TEST_ENGINE, createConnection(["id", "name", "email"])],
+      ]),
+      latestEngineSelected: TEST_ENGINE,
+    });
+
+    expect(await getLabels(analysis.aliasCompletionSource, context)).toContain(
+      "email",
+    );
+    view.destroy();
+  });
+
+  it("resolves aliases when the only schema is implicit", async () => {
+    store.set(dataSourceConnectionsAtom, {
+      connectionsMap: new Map([
+        [TEST_ENGINE, createConnection(["id", "name"], false)],
+      ]),
+      latestEngineSelected: TEST_ENGINE,
+    });
+    const analysis = exportedForTesting.createSQLAnalysis();
+    const doc = "SELECT u. FROM users u";
+    const { context, view } = createCompletionContext(doc, "SELECT u.".length);
+
+    expect(await getLabels(analysis.aliasCompletionSource, context)).toEqual(
+      expect.arrayContaining(["id", "name"]),
+    );
+    view.destroy();
+  });
+
+  it("preserves top-level namespaces when promoting default-schema tables", () => {
+    const connection = createConnection(["id"]);
+    const database = connection.databases[0]!;
+    const publicSchema = database.schemas[0]!;
+    const usersTable = publicSchema.tables[0]!;
+    store.set(dataSourceConnectionsAtom, {
+      connectionsMap: new Map([
+        [
+          TEST_ENGINE,
+          {
+            ...connection,
+            databases: [
+              {
+                ...database,
+                schemas: [
+                  {
+                    ...publicSchema,
+                    tables: [
+                      ...publicSchema.tables,
+                      { ...usersTable, name: "analytics" },
+                      { ...usersTable, name: "test_db" },
+                    ],
+                  },
+                  {
+                    name: "analytics",
+                    tables: [{ ...usersTable, name: "events" }],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      ]),
+      latestEngineSelected: TEST_ENGINE,
+    });
+    const state = EditorState.create({
+      extensions: [languageMetadataField.init(() => metadata)],
+    });
+    const view = new EditorView({ state });
+
+    expect(exportedForTesting.getSchema(view)).toMatchObject({
+      analytics: {
+        self: { label: "analytics", type: "schema" },
+        children: {
+          events: { self: { label: "events", type: "table" } },
+        },
+      },
+      public: {
+        children: {
+          analytics: { self: { label: "analytics", type: "table" } },
+          test_db: { self: { label: "test_db", type: "table" } },
+        },
+      },
+      test_db: {
+        self: { label: "test_db", type: "database" },
+      },
+    });
+    view.destroy();
+  });
+
+  it("resolves a table literally named self", async () => {
+    store.set(datasetsAtom, {
+      tables: [
+        {
+          name: "self",
+          columns: [{ name: "value", type: "string" }],
+        },
+      ],
+    } as DatasetsState);
+    const analysis = exportedForTesting.createSQLAnalysis();
+    const doc = "SELECT s. FROM self s";
+    const { context, view } = createCompletionContext(doc, "SELECT s.".length);
+
+    expect(await getLabels(analysis.aliasCompletionSource, context)).toContain(
+      "value",
+    );
+    view.destroy();
+  });
+
+  it("completes declared CTE columns", async () => {
+    const analysis = exportedForTesting.createSQLAnalysis();
+    const doc =
+      "WITH active_users(user_id, user_email) AS (SELECT id, email FROM users) " +
+      "SELECT active_users. FROM active_users";
+    const pos = doc.indexOf("active_users.") + "active_users.".length;
+    const { context, view } = createCompletionContext(doc, pos);
+
+    expect(await getLabels(analysis.cteCompletionSource, context)).toEqual(
+      expect.arrayContaining(["user_id", "user_email"]),
+    );
+    view.destroy();
+  });
+
+  it("completes columns from tables in the current statement", async () => {
+    const analysis = exportedForTesting.createSQLAnalysis();
+    const doc = "SELECT na FROM users";
+    const { context, view } = createCompletionContext(doc, "SELECT na".length);
+
+    expect(await getLabels(analysis.columnCompletionSource, context)).toContain(
+      "name",
+    );
+    view.destroy();
+  });
+
+  it("reports semantic diagnostics as warnings", async () => {
+    const adapter = new SQLLanguageAdapter();
+    const extensions = adapter.getExtension(
+      {} as CellId,
+      {} as CompletionConfig,
+      {} as HotkeyProvider,
+      {} as PlaceholderType,
+      {
+        diagnostics: { sql_linter: true },
+      } as LSPConfig & { diagnostics: DiagnosticsConfig },
+    );
+    const state = EditorState.create({
+      doc: "SELECT missing FROM users",
+      extensions: [languageMetadataField.init(() => metadata), ...extensions],
+    });
+    const view = new EditorView({ state });
+
+    forceLinting(view);
+    await vi.waitFor(() => {
+      const diagnostics: Array<{ message: string; severity: string }> = [];
+      forEachDiagnostic(view.state, (diagnostic) => {
+        diagnostics.push(diagnostic);
+      });
+      expect(diagnostics).toContainEqual(
+        expect.objectContaining({
+          message: "Column 'missing' not found in table 'users'",
+          severity: "warning",
+        }),
+      );
+    });
+    view.destroy();
+  });
+
+  it("does not report unknown tables", async () => {
+    const adapter = new SQLLanguageAdapter();
+    const extensions = adapter.getExtension(
+      {} as CellId,
+      {} as CompletionConfig,
+      {} as HotkeyProvider,
+      {} as PlaceholderType,
+      {
+        diagnostics: { sql_linter: true },
+      } as LSPConfig & { diagnostics: DiagnosticsConfig },
+    );
+    const state = EditorState.create({
+      doc: "SELECT missing FROM users; SELECT * FROM unknown_table",
+      extensions: [languageMetadataField.init(() => metadata), ...extensions],
+    });
+    const view = new EditorView({ state });
+
+    forceLinting(view);
+    await vi.waitFor(() => {
+      const diagnostics: string[] = [];
+      forEachDiagnostic(view.state, (diagnostic) => {
+        diagnostics.push(diagnostic.message);
+      });
+      expect(diagnostics).toEqual([
+        "Column 'missing' not found in table 'users'",
+      ]);
+    });
+    view.destroy();
+  });
+
+  it("invalidates analysis caches when the engine changes", async () => {
+    const mssqlEngine = "mssql_engine" as ConnectionName;
+    const postgresEngine = "postgres_engine" as ConnectionName;
+    store.set(dataSourceConnectionsAtom, {
+      connectionsMap: new Map([
+        [
+          mssqlEngine,
+          {
+            ...createConnection([]),
+            name: mssqlEngine,
+            dialect: "mssql",
+          },
+        ],
+        [
+          postgresEngine,
+          {
+            ...createConnection([]),
+            name: postgresEngine,
+            dialect: "postgres",
+          },
+        ],
+      ]),
+      latestEngineSelected: mssqlEngine,
+    });
+    const analysis = exportedForTesting.createSQLAnalysis();
+    const state = EditorState.create({
+      doc: "SELECT TOP 1 * FROM users",
+      extensions: [
+        languageMetadataField.init(() => ({
+          ...metadata,
+          engine: mssqlEngine,
+        })),
+      ],
+    });
+    const view = new EditorView({ state });
+
+    const before = await analysis.structureAnalyzer.analyzeDocument(view.state);
+    expect(before[0]?.isValid).toBe(true);
+
+    view.dispatch({
+      effects: updateLanguageMetadata.of({ engine: postgresEngine }),
+    });
+
+    const after = await analysis.structureAnalyzer.analyzeDocument(view.state);
+    expect(after[0]?.isValid).toBe(false);
+    view.destroy();
+  });
+});
+
+describe("CustomSqlParser", () => {
+  beforeEach(() => {
+    store.set(dataSourceConnectionsAtom, {
+      connectionsMap: new Map(),
+      latestEngineSelected: DUCKDB_ENGINE,
+    });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    store.set(dataSourceConnectionsAtom, {
+      connectionsMap: new Map(),
+      latestEngineSelected: DUCKDB_ENGINE,
+    });
+  });
+
+  const createNamedConnectionState = ({
+    doc,
+    engine,
+    dialect,
+  }: {
+    doc: string;
+    engine: ConnectionName;
+    dialect: string;
+  }) => {
+    store.set(dataSourceConnectionsAtom, {
+      connectionsMap: new Map([
+        [
+          engine,
+          {
+            name: engine,
+            dialect,
+            display_name: engine,
+            source: dialect,
+            databases: [],
+          },
+        ],
+      ]),
+      latestEngineSelected: engine,
+    });
+    return EditorState.create({
+      doc,
+      extensions: [
+        languageMetadataField.init(() => ({
+          dataframeName: "_df",
+          quotePrefix: "f",
+          commentLines: [],
+          showOutput: true,
+          engine,
+        })),
+      ],
+    });
+  };
+
+  it("uses backend DuckDB validation", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(sqlMode, "getSQLMode").mockReturnValue("validate");
+    const error = {
+      message: "Backend syntax error",
+      line: 1,
+      column: 1,
+      severity: "error" as const,
+    };
+    const request = vi.spyOn(ValidateSQL, "request").mockResolvedValue({
+      error: null,
+      parse_result: { success: false, errors: [error] },
+      request_id: "request-id",
+      validate_result: null,
+    });
+    const state = EditorState.create({
+      doc: "SELECT",
+      extensions: [
+        languageMetadataField.init(() => ({
+          dataframeName: "_df",
+          quotePrefix: "f",
+          commentLines: [],
+          showOutput: true,
+          engine: DUCKDB_ENGINE,
+        })),
+      ],
+    });
+    const parser = new exportedForTesting.CustomSqlParser();
+    parser.setFocusState(true);
+
+    const result = parser.validateSql("SELECT", { state });
+    await vi.runAllTimersAsync();
+
+    await expect(result).resolves.toEqual([error]);
+    // No connection is registered for the internal engine, so the dialect
+    // falls back to DEFAULT_PARSER_DIALECT ("DuckDB").
+    expect(request).toHaveBeenCalledWith({
+      dialect: "DuckDB",
+      engine: DUCKDB_ENGINE,
+      onlyParse: false,
+      query: "SELECT",
+    });
+  });
+
+  it("resolves superseded validation requests instead of leaving them pending", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(sqlMode, "getSQLMode").mockReturnValue("validate");
+    const error = {
+      message: "Backend syntax error",
+      line: 1,
+      column: 1,
+      severity: "error" as const,
+    };
+    vi.spyOn(ValidateSQL, "request").mockResolvedValue({
+      error: null,
+      parse_result: { success: false, errors: [error] },
+      request_id: "request-id",
+      validate_result: null,
+    });
+    const state = EditorState.create({
+      doc: "SELECT",
+      extensions: [
+        languageMetadataField.init(() => ({
+          dataframeName: "_df",
+          quotePrefix: "f",
+          commentLines: [],
+          showOutput: true,
+          engine: DUCKDB_ENGINE,
+        })),
+      ],
+    });
+    const parser = new exportedForTesting.CustomSqlParser();
+    parser.setFocusState(true);
+
+    // Simulate a rapid edit: a second validation call arrives before the
+    // first call's internal debounce timer has fired. The first call should
+    // resolve (with no errors) rather than hang forever.
+    const first = parser.validateSql("SELECT 1", { state });
+    await vi.advanceTimersByTimeAsync(100);
+    const second = parser.validateSql("SELECT 2", { state });
+    await vi.runAllTimersAsync();
+
+    await expect(first).resolves.toEqual([]);
+    await expect(second).resolves.toEqual([error]);
+  });
+
+  it("uses backend validation for a named DuckDB connection", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(sqlMode, "getSQLMode").mockReturnValue("validate");
+    const query =
+      'INSERT OR IGNORE INTO "rebalance-dates" (Timestamp) VALUES (CURRENT_TIMESTAMP);';
+    const error = {
+      message: "Named DuckDB backend result",
+      line: 1,
+      column: 1,
+      severity: "error" as const,
+    };
+    const request = vi.spyOn(ValidateSQL, "request").mockResolvedValue({
+      error: null,
+      parse_result: { success: false, errors: [error] },
+      request_id: "request-id",
+      validate_result: null,
+    });
+    const state = createNamedConnectionState({
+      doc: query,
+      engine: "con" as ConnectionName,
+      dialect: "duckdb",
+    });
+    const parser = new exportedForTesting.CustomSqlParser();
+    parser.setFocusState(true);
+
+    const result = parser.validateSql(query, { state });
+    await vi.runAllTimersAsync();
+
+    await expect(result).resolves.toEqual([error]);
+    expect(request).toHaveBeenCalledWith({
+      dialect: "DuckDB",
+      engine: "con",
+      onlyParse: true,
+      query,
+    });
+  });
+
+  it("skips client-side parsing for named DuckDB SQL", async () => {
+    const query = "CHECKPOINT;";
+    const state = createNamedConnectionState({
+      doc: query,
+      engine: "con" as ConnectionName,
+      dialect: "duckdb",
+    });
+    const parser = new exportedForTesting.CustomSqlParser();
+
+    await expect(parser.parse(query, { state })).resolves.toEqual({
+      success: true,
+      errors: [],
+    });
+  });
+
+  it("preserves client-side parsing for non-DuckDB connections", async () => {
+    const query = "SELECT TOP 1 * FROM users";
+    const state = createNamedConnectionState({
+      doc: query,
+      engine: "postgres_con" as ConnectionName,
+      dialect: "postgres",
+    });
+    const parser = new exportedForTesting.CustomSqlParser();
+
+    await expect(parser.parse(query, { state })).resolves.toMatchObject({
+      success: false,
+    });
+  });
+
+  it("preserves client-side parsing for an unregistered connection", async () => {
+    // No entry is registered in the data source connections store for this
+    // engine, so its dialect cannot be resolved (unlike a known non-DuckDB
+    // dialect, which resolves to a non-null, non-DuckDB value).
+    const query = "SELECT TOP 1 * FROM users";
+    const state = EditorState.create({
+      doc: query,
+      extensions: [
+        languageMetadataField.init(() => ({
+          dataframeName: "_df",
+          quotePrefix: "f",
+          commentLines: [],
+          showOutput: true,
+          engine: "unregistered_con" as ConnectionName,
+        })),
+      ],
+    });
+    const parser = new exportedForTesting.CustomSqlParser();
+
+    await expect(parser.parse(query, { state })).resolves.toMatchObject({
+      success: false,
+    });
+  });
+});
+
+describe("tablesCompletionSource", () => {
+  const mockStore = store;
+  const completionStore = new TestSQLCompletionStore();
+
+  beforeEach(() => {
+    // Reset the adapter engine
+    setLatestEngineSelected(DUCKDB_ENGINE);
+    // reset the datasets state
+    mockStore.set(datasetsAtom, {
+      tables: [],
+    } as unknown as DatasetsState);
+
+    // reset the dataSourceConnectionsAtom
+    mockStore.set(dataSourceConnectionsAtom, {
+      connectionsMap: new Map(),
+      latestEngineSelected: DUCKDB_ENGINE,
+    });
+  });
+
+  it("should return null if connection not found", () => {
+    mockStore.set(dataSourceConnectionsAtom, {
+      connectionsMap: new Map(),
+      latestEngineSelected: DUCKDB_ENGINE,
+    });
+
+    const completionSource = completionStore.getCompletionSource(TEST_ENGINE);
+    expect(completionSource).toBe(null);
+  });
+
+  it("should create schema with schema.table structure", () => {
+    const mockConnection: DataSourceConnection = {
+      name: TEST_ENGINE,
+      dialect: "duckdb",
+      display_name: "duckdb",
+      source: "duckdb",
+      databases: [
+        {
+          dialect: "duckdb",
+          name: "test_db",
+          schemas: [
+            {
+              name: "public",
+              tables: [
+                {
+                  name: "users",
+                  source: "duckdb",
+                  source_type: "local",
+                  type: "table",
+                  num_columns: 0,
+                  num_rows: 0,
+                  variable_name: null,
+                  columns: [
+                    {
+                      name: "id",
+                      external_type: "string",
+                      type: "string",
+                      sample_values: [],
+                    },
+                    {
+                      name: "name",
+                      external_type: "string",
+                      type: "string",
+                      sample_values: [],
+                    },
+                    {
+                      name: "email",
+                      external_type: "string",
+                      type: "string",
+                      sample_values: [],
+                    },
+                  ],
+                },
+                {
+                  name: "orders",
+                  source: "duckdb",
+                  source_type: "local",
+                  type: "table",
+                  num_columns: 0,
+                  num_rows: 0,
+                  variable_name: null,
+                  columns: [
+                    {
+                      name: "order_id",
+                      external_type: "string",
+                      type: "string",
+                      sample_values: [],
+                    },
+                    {
+                      name: "user_id",
+                      external_type: "string",
+                      type: "string",
+                      sample_values: [],
+                    },
+                    {
+                      name: "total",
+                      external_type: "number",
+                      type: "number",
+                      sample_values: [],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+
+    mockStore.set(dataSourceConnectionsAtom, {
+      connectionsMap: new Map([[TEST_ENGINE, mockConnection]]),
+      latestEngineSelected: TEST_ENGINE,
+    });
+
+    const completionSource = completionStore.getCompletionSource(TEST_ENGINE);
+    expect(completionSource?.defaultTable).toBeUndefined();
+    expect(completionSource?.dialect).toBe(DuckDBDialect);
+    expect(completionSource?.schema).toMatchInlineSnapshot(`
+      {
+        "public": {
+          "children": {
+            "orders": {
+              "children": [
+                {
+                  "info": [Function],
+                  "label": "order_id",
+                  "type": "column",
+                },
+                {
+                  "info": [Function],
+                  "label": "user_id",
+                  "type": "column",
+                },
+                {
+                  "info": [Function],
+                  "label": "total",
+                  "type": "column",
+                },
+              ],
+              "self": {
+                "info": [Function],
+                "label": "orders",
+                "type": "table",
+              },
+            },
+            "users": {
+              "children": [
+                {
+                  "info": [Function],
+                  "label": "id",
+                  "type": "column",
+                },
+                {
+                  "info": [Function],
+                  "label": "name",
+                  "type": "column",
+                },
+                {
+                  "info": [Function],
+                  "label": "email",
+                  "type": "column",
+                },
+              ],
+              "self": {
+                "info": [Function],
+                "label": "users",
+                "type": "table",
+              },
+            },
+          },
+          "self": {
+            "detail": "public",
+            "info": [Function],
+            "label": "public",
+            "type": "schema",
+          },
+        },
+        "test_db": {
+          "children": {
+            "public": {
+              "children": {
+                "orders": {
+                  "children": [
+                    {
+                      "info": [Function],
+                      "label": "order_id",
+                      "type": "column",
+                    },
+                    {
+                      "info": [Function],
+                      "label": "user_id",
+                      "type": "column",
+                    },
+                    {
+                      "info": [Function],
+                      "label": "total",
+                      "type": "column",
+                    },
+                  ],
+                  "self": {
+                    "info": [Function],
+                    "label": "orders",
+                    "type": "table",
+                  },
+                },
+                "users": {
+                  "children": [
+                    {
+                      "info": [Function],
+                      "label": "id",
+                      "type": "column",
+                    },
+                    {
+                      "info": [Function],
+                      "label": "name",
+                      "type": "column",
+                    },
+                    {
+                      "info": [Function],
+                      "label": "email",
+                      "type": "column",
+                    },
+                  ],
+                  "self": {
+                    "info": [Function],
+                    "label": "users",
+                    "type": "table",
+                  },
+                },
+              },
+              "self": {
+                "detail": "test_db.public",
+                "info": [Function],
+                "label": "public",
+                "type": "schema",
+              },
+            },
+          },
+          "self": {
+            "detail": "test_db",
+            "info": [Function],
+            "label": "test_db",
+            "type": "database",
+          },
+        },
+      }
+    `);
+  });
+
+  it("should handle multiple databases and schemas", () => {
+    const mockConnection: DataSourceConnection = {
+      name: "multi_db_engine" as ConnectionName,
+      dialect: "postgres",
+      display_name: "postgres",
+      source: "postgres",
+      databases: [
+        {
+          name: "db1",
+          dialect: "postgres",
+          schemas: [
+            {
+              name: "schema1",
+              tables: [
+                {
+                  name: "table1",
+                  source: "postgres",
+                  source_type: "local",
+                  type: "table",
+                  num_columns: 0,
+                  num_rows: 0,
+                  variable_name: null,
+                  columns: [
+                    {
+                      name: "col1",
+                      external_type: "string",
+                      type: "string",
+                      sample_values: [],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+        {
+          name: "db2",
+          dialect: "postgres",
+          schemas: [
+            {
+              name: "schema2",
+              tables: [
+                {
+                  name: "table2",
+                  source: "postgres",
+                  source_type: "local",
+                  type: "table",
+                  num_columns: 0,
+                  num_rows: 0,
+                  variable_name: null,
+                  columns: [
+                    {
+                      name: "col2",
+                      external_type: "string",
+                      type: "string",
+                      sample_values: [],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+
+    mockStore.set(dataSourceConnectionsAtom, {
+      connectionsMap: new Map([[mockConnection.name, mockConnection]]),
+      latestEngineSelected: mockConnection.name,
+    });
+
+    const completionSource = completionStore.getCompletionSource(
+      "multi_db_engine" as ConnectionName,
+    );
+    // expect fully qualified 'database.schema.table' names
+    // as there is no default database
+    expect(completionSource?.schema).toMatchInlineSnapshot(`
+      {
+        "db1": {
+          "children": {
+            "schema1": {
+              "children": {
+                "table1": {
+                  "children": [
+                    {
+                      "info": [Function],
+                      "label": "col1",
+                      "type": "column",
+                    },
+                  ],
+                  "self": {
+                    "info": [Function],
+                    "label": "table1",
+                    "type": "table",
+                  },
+                },
+              },
+              "self": {
+                "detail": "db1.schema1",
+                "info": [Function],
+                "label": "schema1",
+                "type": "schema",
+              },
+            },
+          },
+          "self": {
+            "detail": "db1",
+            "info": [Function],
+            "label": "db1",
+            "type": "database",
+          },
+        },
+        "db2": {
+          "children": {
+            "schema2": {
+              "children": {
+                "table2": {
+                  "children": [
+                    {
+                      "info": [Function],
+                      "label": "col2",
+                      "type": "column",
+                    },
+                  ],
+                  "self": {
+                    "info": [Function],
+                    "label": "table2",
+                    "type": "table",
+                  },
+                },
+              },
+              "self": {
+                "detail": "db2.schema2",
+                "info": [Function],
+                "label": "schema2",
+                "type": "schema",
+              },
+            },
+          },
+          "self": {
+            "detail": "db2",
+            "info": [Function],
+            "label": "db2",
+            "type": "database",
+          },
+        },
+      }
+    `);
+    expect(completionSource?.defaultTable).toBeUndefined();
+  });
+
+  it("should handle multiple databases and schemas with default", () => {
+    const mockConnection: DataSourceConnection = {
+      name: "multi_db_engine" as ConnectionName,
+      dialect: "postgres",
+      display_name: "postgres",
+      source: "postgres",
+      default_schema: "schema2",
+      default_database: "db1",
+      databases: [
+        {
+          name: "db1",
+          dialect: "postgres",
+          schemas: [
+            {
+              name: "schema1",
+              tables: [
+                {
+                  name: "table1",
+                  source: "postgres",
+                  source_type: "local",
+                  type: "table",
+                  num_columns: 0,
+                  num_rows: 0,
+                  variable_name: null,
+                  columns: [
+                    {
+                      name: "col1",
+                      external_type: "string",
+                      type: "string",
+                      sample_values: [],
+                    },
+                  ],
+                },
+              ],
+            },
+            {
+              name: "schema2",
+              tables: [
+                {
+                  name: "table2",
+                  source: "postgres",
+                  source_type: "local",
+                  type: "table",
+                  num_columns: 0,
+                  num_rows: 0,
+                  variable_name: null,
+                  columns: [
+                    {
+                      name: "col2",
+                      external_type: "string",
+                      type: "string",
+                      sample_values: [],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+        {
+          name: "db2",
+          dialect: "postgres",
+          schemas: [
+            {
+              name: "schema2",
+              tables: [
+                {
+                  name: "table2",
+                  source: "postgres",
+                  source_type: "local",
+                  type: "table",
+                  num_columns: 0,
+                  num_rows: 0,
+                  variable_name: null,
+                  columns: [
+                    {
+                      name: "col2",
+                      external_type: "string",
+                      type: "string",
+                      sample_values: [],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+        {
+          name: "db3",
+          dialect: "postgres",
+          schemas: [
+            {
+              name: "schema2",
+              tables: [
+                {
+                  name: "table2",
+                  source: "postgres",
+                  source_type: "local",
+                  type: "table",
+                  num_columns: 0,
+                  num_rows: 0,
+                  variable_name: null,
+                  columns: [
+                    {
+                      name: "col2",
+                      external_type: "string",
+                      type: "string",
+                      sample_values: [],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+
+    mockStore.set(dataSourceConnectionsAtom, {
+      connectionsMap: new Map([[mockConnection.name, mockConnection]]),
+      latestEngineSelected: mockConnection.name,
+    });
+
+    const completionSource = completionStore.getCompletionSource(
+      "multi_db_engine" as ConnectionName,
+    );
+    expect(completionSource?.schema).toMatchInlineSnapshot(`
+      {
+        "db1": {
+          "children": {
+            "schema1": {
+              "children": {
+                "table1": {
+                  "children": [
+                    {
+                      "info": [Function],
+                      "label": "col1",
+                      "type": "column",
+                    },
+                  ],
+                  "self": {
+                    "info": [Function],
+                    "label": "table1",
+                    "type": "table",
+                  },
+                },
+              },
+              "self": {
+                "detail": "db1.schema1",
+                "info": [Function],
+                "label": "schema1",
+                "type": "schema",
+              },
+            },
+            "schema2": {
+              "children": {
+                "table2": {
+                  "children": [
+                    {
+                      "info": [Function],
+                      "label": "col2",
+                      "type": "column",
+                    },
+                  ],
+                  "self": {
+                    "info": [Function],
+                    "label": "table2",
+                    "type": "table",
+                  },
+                },
+              },
+              "self": {
+                "detail": "db1.schema2",
+                "info": [Function],
+                "label": "schema2",
+                "type": "schema",
+              },
+            },
+          },
+          "self": {
+            "detail": "db1",
+            "info": [Function],
+            "label": "db1",
+            "type": "database",
+          },
+        },
+        "db2": {
+          "children": {
+            "schema2": {
+              "children": {
+                "table2": {
+                  "children": [
+                    {
+                      "info": [Function],
+                      "label": "col2",
+                      "type": "column",
+                    },
+                  ],
+                  "self": {
+                    "info": [Function],
+                    "label": "table2",
+                    "type": "table",
+                  },
+                },
+              },
+              "self": {
+                "detail": "db2.schema2",
+                "info": [Function],
+                "label": "schema2",
+                "type": "schema",
+              },
+            },
+          },
+          "self": {
+            "detail": "db2",
+            "info": [Function],
+            "label": "db2",
+            "type": "database",
+          },
+        },
+        "db3": {
+          "children": {
+            "schema2": {
+              "children": {
+                "table2": {
+                  "children": [
+                    {
+                      "info": [Function],
+                      "label": "col2",
+                      "type": "column",
+                    },
+                  ],
+                  "self": {
+                    "info": [Function],
+                    "label": "table2",
+                    "type": "table",
+                  },
+                },
+              },
+              "self": {
+                "detail": "db3.schema2",
+                "info": [Function],
+                "label": "schema2",
+                "type": "schema",
+              },
+            },
+          },
+          "self": {
+            "detail": "db3",
+            "info": [Function],
+            "label": "db3",
+            "type": "database",
+          },
+        },
+        "schema1": {
+          "children": {
+            "table1": {
+              "children": [
+                {
+                  "info": [Function],
+                  "label": "col1",
+                  "type": "column",
+                },
+              ],
+              "self": {
+                "info": [Function],
+                "label": "table1",
+                "type": "table",
+              },
+            },
+          },
+          "self": {
+            "detail": "schema1",
+            "info": [Function],
+            "label": "schema1",
+            "type": "schema",
+          },
+        },
+        "schema2": {
+          "children": {
+            "table2": {
+              "children": [
+                {
+                  "info": [Function],
+                  "label": "col2",
+                  "type": "column",
+                },
+              ],
+              "self": {
+                "info": [Function],
+                "label": "table2",
+                "type": "table",
+              },
+            },
+          },
+          "self": {
+            "detail": "schema2",
+            "info": [Function],
+            "label": "schema2",
+            "type": "schema",
+          },
+        },
+      }
+    `);
+    expect(completionSource?.defaultTable).toBeUndefined();
+    expect(completionSource?.defaultSchema).toBe("schema2");
+  });
+
+  it("should handle default schema", () => {
+    const mockConnection: DataSourceConnection = {
+      name: TEST_ENGINE,
+      dialect: "postgres",
+      display_name: "postgres",
+      source: "postgres",
+      default_schema: "public",
+      default_database: "test_db",
+      databases: [
+        {
+          name: "test_db",
+          dialect: "postgres",
+          schemas: [
+            {
+              name: "public",
+              tables: [
+                {
+                  name: "users",
+                  source: "postgres",
+                  source_type: "local",
+                  type: "table",
+                  num_columns: 0,
+                  num_rows: 0,
+                  variable_name: null,
+                  columns: [
+                    {
+                      name: "id",
+                      external_type: "string",
+                      type: "string",
+                      sample_values: [],
+                    },
+                    {
+                      name: "name",
+                      external_type: "string",
+                      type: "string",
+                      sample_values: [],
+                    },
+                    {
+                      name: "email",
+                      external_type: "string",
+                      type: "string",
+                      sample_values: [],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+
+    mockStore.set(dataSourceConnectionsAtom, {
+      connectionsMap: new Map([[mockConnection.name, mockConnection]]),
+      latestEngineSelected: mockConnection.name,
+    });
+
+    const completionSource = completionStore.getCompletionSource(TEST_ENGINE);
+    expect(completionSource?.schema).toMatchInlineSnapshot(`
+      {
+        "public": {
+          "children": {
+            "users": {
+              "children": [
+                {
+                  "info": [Function],
+                  "label": "id",
+                  "type": "column",
+                },
+                {
+                  "info": [Function],
+                  "label": "name",
+                  "type": "column",
+                },
+                {
+                  "info": [Function],
+                  "label": "email",
+                  "type": "column",
+                },
+              ],
+              "self": {
+                "info": [Function],
+                "label": "users",
+                "type": "table",
+              },
+            },
+          },
+          "self": {
+            "detail": "public",
+            "info": [Function],
+            "label": "public",
+            "type": "schema",
+          },
+        },
+        "test_db": {
+          "children": {
+            "public": {
+              "children": {
+                "users": {
+                  "children": [
+                    {
+                      "info": [Function],
+                      "label": "id",
+                      "type": "column",
+                    },
+                    {
+                      "info": [Function],
+                      "label": "name",
+                      "type": "column",
+                    },
+                    {
+                      "info": [Function],
+                      "label": "email",
+                      "type": "column",
+                    },
+                  ],
+                  "self": {
+                    "info": [Function],
+                    "label": "users",
+                    "type": "table",
+                  },
+                },
+              },
+              "self": {
+                "detail": "test_db.public",
+                "info": [Function],
+                "label": "public",
+                "type": "schema",
+              },
+            },
+          },
+          "self": {
+            "detail": "test_db",
+            "info": [Function],
+            "label": "test_db",
+            "type": "database",
+          },
+        },
+      }
+    `);
+    expect(completionSource?.defaultTable).toBe("users");
+    expect(completionSource?.defaultSchema).toBe("public");
+  });
+
+  it("should create a default table if there is only one table", () => {
+    const mockConnection: DataSourceConnection = {
+      name: TEST_ENGINE,
+      dialect: "postgres",
+      display_name: "postgres",
+      source: "postgres",
+      databases: [
+        {
+          name: "test_db",
+          dialect: "postgres",
+          schemas: [
+            {
+              name: "public",
+              tables: [
+                {
+                  name: "users",
+                  source: "postgres",
+                  source_type: "local",
+                  type: "table",
+                  num_columns: 0,
+                  num_rows: 0,
+                  variable_name: null,
+                  columns: [],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+
+    mockStore.set(dataSourceConnectionsAtom, {
+      connectionsMap: new Map([[mockConnection.name, mockConnection]]),
+      latestEngineSelected: mockConnection.name,
+    });
+
+    const completionSource = completionStore.getCompletionSource(TEST_ENGINE);
+    expect(completionSource?.defaultTable).toBe("users");
+    expect(completionSource?.defaultSchema).toBe("public");
+    expect(completionSource?.dialect).toBe(PostgreSQL);
+  });
+
+  it("should handle schemaless databases", () => {
+    const mockConnection: DataSourceConnection = {
+      name: TEST_ENGINE,
+      dialect: "postgres",
+      display_name: "postgres",
+      default_database: "test_db",
+      source: "postgres",
+      databases: [
+        {
+          name: "test_db",
+          dialect: "postgres",
+          schemas: [
+            {
+              name: "", // lack of name indicates schemaless
+              tables: [
+                {
+                  name: "users",
+                  source: "postgres",
+                  source_type: "local",
+                  type: "table",
+                  num_columns: 0,
+                  num_rows: 0,
+                  variable_name: null,
+                  columns: [
+                    {
+                      name: "id",
+                      external_type: "string",
+                      type: "string",
+                      sample_values: [],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+        {
+          name: "test_db2",
+          dialect: "postgres",
+          schemas: [
+            {
+              name: "",
+              tables: [
+                {
+                  name: "orders",
+                  source: "postgres",
+                  source_type: "local",
+                  type: "table",
+                  num_columns: 0,
+                  num_rows: 0,
+                  variable_name: null,
+                  columns: [
+                    {
+                      name: "order_id",
+                      external_type: "string",
+                      type: "string",
+                      sample_values: [],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+
+    mockStore.set(dataSourceConnectionsAtom, {
+      connectionsMap: new Map([[mockConnection.name, mockConnection]]),
+      latestEngineSelected: mockConnection.name,
+    });
+
+    const completionSource = completionStore.getCompletionSource(TEST_ENGINE);
+    expect(completionSource?.defaultTable).toBe(undefined);
+    expect(completionSource?.dialect).toBe(PostgreSQL);
+    expect(completionSource?.schema).toMatchInlineSnapshot(`
+      {
+        "test_db": {
+          "children": {},
+          "self": {
+            "detail": "test_db",
+            "info": [Function],
+            "label": "test_db",
+            "type": "database",
+          },
+        },
+        "test_db2": {
+          "children": {
+            "orders": {
+              "children": [
+                {
+                  "info": [Function],
+                  "label": "order_id",
+                  "type": "column",
+                },
+              ],
+              "self": {
+                "info": [Function],
+                "label": "orders",
+                "type": "table",
+              },
+            },
+          },
+          "self": {
+            "detail": "test_db2",
+            "info": [Function],
+            "label": "test_db2",
+            "type": "database",
+          },
+        },
+        "users": {
+          "children": [
+            {
+              "info": [Function],
+              "label": "id",
+              "type": "column",
+            },
+          ],
+          "self": {
+            "info": [Function],
+            "label": "users",
+            "type": "table",
+          },
+        },
+      }
+    `);
+  });
+
+  describe("completion sources", () => {
+    describe("SQL Completions", () => {
+      const completionStore = new TestSQLCompletionStore();
+
+      beforeEach(() => {
+        // Reset state
+        setLatestEngineSelected(DUCKDB_ENGINE);
+        store.set(datasetsAtom, {
+          tables: [],
+        } as unknown as DatasetsState);
+        store.set(dataSourceConnectionsAtom, {
+          connectionsMap: new Map(),
+          latestEngineSelected: DUCKDB_ENGINE,
+        });
+      });
+
+      const createEditorState = (
+        doc: string,
+        metadata?: Partial<SQLLanguageAdapterMetadata>,
+      ) => {
+        const defaultMetadata: SQLLanguageAdapterMetadata = {
+          dataframeName: "_df",
+          quotePrefix: "f",
+          commentLines: [],
+          showOutput: true,
+          engine: DUCKDB_ENGINE,
+          ...metadata,
+        };
+
+        return EditorState.create({
+          doc,
+          extensions: [
+            languageMetadataField.init(() => defaultMetadata),
+            sql({ dialect: PostgreSQL }),
+          ],
+        });
+      };
+
+      const createCompletionContext = (
+        state: EditorState,
+        pos: number,
+      ): CompletionContext => {
+        return new CompletionContext(state, pos, false);
+      };
+
+      const getCompletionSources = (
+        extensions: readonly Extension[],
+      ): readonly CompletionSource[] | undefined => {
+        for (const extension of extensions) {
+          if (Array.isArray(extension)) {
+            const sources = getCompletionSources(extension);
+            if (sources) {
+              return sources;
+            }
+            continue;
+          }
+
+          const config = extension as {
+            value?: { override?: readonly CompletionSource[] };
+          };
+          if (config.value?.override) {
+            return config.value.override;
+          }
+        }
+        return undefined;
+      };
+
+      describe("tablesCompletionSource", () => {
+        it("should return null when no connection exists", async () => {
+          const state = createEditorState("SELECT * FROM ");
+          const ctx = createCompletionContext(state, 14);
+
+          const adapter = new SQLLanguageAdapter();
+          const extensions = adapter.getExtension(...TEST_EXTENSION_ARGS);
+          const completion = getCompletionSources(extensions)?.[0];
+
+          expect(completion).toBeDefined();
+          const result = await completion!(ctx);
+          expect(result).toBeNull();
+        });
+
+        it("should provide table completions when connection exists", async () => {
+          const mockConnection: DataSourceConnection = {
+            name: TEST_ENGINE,
+            dialect: "postgres",
+            display_name: "postgres",
+            source: "postgres",
+            databases: [
+              {
+                name: "test_db",
+                dialect: "postgres",
+                schemas: [
+                  {
+                    name: "public",
+                    tables: [
+                      {
+                        name: "users",
+                        source: "postgres",
+                        source_type: "local",
+                        type: "table",
+                        num_columns: 0,
+                        num_rows: 0,
+                        variable_name: null,
+                        columns: [
+                          {
+                            name: "id",
+                            external_type: "string",
+                            type: "string",
+                            sample_values: [],
+                          },
+                          {
+                            name: "name",
+                            external_type: "string",
+                            type: "string",
+                            sample_values: [],
+                          },
+                        ],
+                      },
+                    ],
+                  },
+                ],
+              },
+            ],
+          };
+
+          store.set(dataSourceConnectionsAtom, {
+            connectionsMap: new Map([[TEST_ENGINE, mockConnection]]),
+            latestEngineSelected: TEST_ENGINE,
+          });
+
+          const state = createEditorState("SELECT * FROM u", {
+            engine: TEST_ENGINE,
+          });
+          const ctx = createCompletionContext(state, 15);
+
+          const adapter = new SQLLanguageAdapter();
+          const extensions = adapter.getExtension(...TEST_EXTENSION_ARGS);
+          const completion = getCompletionSources(extensions)?.[0];
+
+          expect(completion).toBeDefined();
+          const result = await completion!(ctx);
+          expect(result).toBeDefined();
+          expect(result?.options.length).toBeGreaterThan(0);
+        });
+
+        it("should include local datasets in completions", async () => {
+          const mockConnection: DataSourceConnection = {
+            name: TEST_ENGINE,
+            dialect: "duckdb",
+            display_name: "duckdb",
+            source: "duckdb",
+            databases: [],
+          };
+
+          store.set(dataSourceConnectionsAtom, {
+            connectionsMap: new Map([[TEST_ENGINE, mockConnection]]),
+            latestEngineSelected: TEST_ENGINE,
+          });
+
+          store.set(datasetsAtom, { tables: testDatasets } as DatasetsState);
+
+          const state = createEditorState("SELECT * FROM d", {
+            engine: TEST_ENGINE,
+          });
+          const ctx = createCompletionContext(state, 15);
+
+          const adapter = new SQLLanguageAdapter();
+          const extensions = adapter.getExtension(...TEST_EXTENSION_ARGS);
+          const completion = getCompletionSources(extensions)?.[0];
+
+          expect(completion).toBeDefined();
+          const result = await completion!(ctx);
+          expect(result).toBeDefined();
+          expect(result?.options.some((opt) => opt.label === "dataset1")).toBe(
+            true,
+          );
+        });
+      });
+
+      describe("customKeywordCompletionSource", () => {
+        it("should provide SQL keyword completions", async () => {
+          const mockConnection: DataSourceConnection = {
+            name: TEST_ENGINE,
+            dialect: "postgres",
+            display_name: "postgres",
+            source: "postgres",
+            databases: [],
+          };
+
+          store.set(dataSourceConnectionsAtom, {
+            connectionsMap: new Map([[TEST_ENGINE, mockConnection]]),
+            latestEngineSelected: TEST_ENGINE,
+          });
+
+          const state = createEditorState("SEL", {
+            engine: TEST_ENGINE,
+          });
+          const ctx = createCompletionContext(state, 3);
+
+          const adapter = new SQLLanguageAdapter();
+          const extensions = adapter.getExtension(...TEST_EXTENSION_ARGS);
+          const completion = getCompletionSources(extensions)?.[2];
+
+          expect(completion).toBeDefined();
+          const result = await completion!(ctx);
+          expect(result).toBeDefined();
+          expect(result?.options.some((opt) => opt.label === "SELECT")).toBe(
+            true,
+          );
+        });
+
+        it("should not provide keyword completions after dot", async () => {
+          const mockConnection: DataSourceConnection = {
+            name: TEST_ENGINE,
+            dialect: "postgres",
+            display_name: "postgres",
+            source: "postgres",
+            databases: [],
+          };
+
+          store.set(dataSourceConnectionsAtom, {
+            connectionsMap: new Map([[TEST_ENGINE, mockConnection]]),
+            latestEngineSelected: TEST_ENGINE,
+          });
+
+          const state = createEditorState("SELECT users.n", {
+            engine: TEST_ENGINE,
+          });
+          const ctx = createCompletionContext(state, 14);
+
+          const adapter = new SQLLanguageAdapter();
+          const extensions = adapter.getExtension(...TEST_EXTENSION_ARGS);
+          const completion = getCompletionSources(extensions)?.[2];
+
+          expect(completion).toBeDefined();
+          const result = await completion!(ctx);
+          expect(result).toBeNull();
+        });
+
+        it("should use correct dialect for different engines", () => {
+          const mysqlConnection: DataSourceConnection = {
+            name: "mysql_engine" as ConnectionName,
+            dialect: "mysql",
+            display_name: "mysql",
+            source: "mysql",
+            databases: [],
+          };
+
+          store.set(dataSourceConnectionsAtom, {
+            connectionsMap: new Map([[mysqlConnection.name, mysqlConnection]]),
+            latestEngineSelected: mysqlConnection.name,
+          });
+
+          // Test that the correct dialect is used
+          const dialect = completionStore.getDialect(mysqlConnection.name);
+          expect(dialect).toBeDefined();
+          expect(dialect?.spec.keywords).toBeDefined();
+        });
+      });
+
+      describe("variableCompletionSource", () => {
+        it("should be included in extension overrides", () => {
+          const adapter = new SQLLanguageAdapter();
+          const extensions = adapter.getExtension(...TEST_EXTENSION_ARGS);
+          const completion = getCompletionSources(extensions);
+
+          expect(completion).toBeDefined();
+          expect(completion).toHaveLength(6);
+        });
+      });
+    });
+  });
+
+  it("should return local tables", () => {
+    mockStore.set(datasetsAtom, { tables: testDatasets } as DatasetsState);
+
+    const mockConnection: DataSourceConnection = {
+      name: TEST_ENGINE,
+      dialect: "duckdb",
+      display_name: "duckdb",
+      default_database: "test_db",
+      default_schema: "test_schema",
+      source: "duckdb",
+      databases: [
+        {
+          dialect: "duckdb",
+          name: "test_db",
+          schemas: [
+            {
+              name: "test_schema",
+              tables: [
+                {
+                  name: "dataset2",
+                  source: "duckdb",
+                  source_type: "local",
+                  type: "table",
+                  num_columns: 0,
+                  num_rows: 0,
+                  variable_name: null,
+                  columns: [
+                    {
+                      name: "col1",
+                      external_type: "string",
+                      type: "string",
+                      sample_values: [],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    mockStore.set(dataSourceConnectionsAtom, {
+      connectionsMap: new Map([[TEST_ENGINE, mockConnection]]),
+      latestEngineSelected: TEST_ENGINE,
+    });
+
+    const completionSource = completionStore.getCompletionSource(TEST_ENGINE);
+    expect(completionSource?.schema).toMatchInlineSnapshot(`
+      {
+        "dataset1": {
+          "children": [
+            {
+              "info": [Function],
+              "label": "col1",
+              "type": "column",
+            },
+            {
+              "info": [Function],
+              "label": "col2",
+              "type": "column",
+            },
+          ],
+          "self": {
+            "info": [Function],
+            "label": "dataset1",
+            "type": "table",
+          },
+        },
+        "test_db": {
+          "children": {
+            "test_schema": {
+              "children": {
+                "dataset2": {
+                  "children": [
+                    {
+                      "info": [Function],
+                      "label": "col1",
+                      "type": "column",
+                    },
+                  ],
+                  "self": {
+                    "info": [Function],
+                    "label": "dataset2",
+                    "type": "table",
+                  },
+                },
+              },
+              "self": {
+                "detail": "test_db.test_schema",
+                "info": [Function],
+                "label": "test_schema",
+                "type": "schema",
+              },
+            },
+          },
+          "self": {
+            "detail": "test_db",
+            "info": [Function],
+            "label": "test_db",
+            "type": "database",
+          },
+        },
+        "test_schema": {
+          "children": {
+            "dataset2": {
+              "children": [
+                {
+                  "info": [Function],
+                  "label": "col1",
+                  "type": "column",
+                },
+              ],
+              "self": {
+                "info": [Function],
+                "label": "dataset2",
+                "type": "table",
+              },
+            },
+          },
+          "self": {
+            "detail": "test_schema",
+            "info": [Function],
+            "label": "test_schema",
+            "type": "schema",
+          },
+        },
+      }
+    `);
+  });
+
+  it("should return new connection tables when connection is updated", () => {
+    mockStore.set(dataSourceConnectionsAtom, {
+      connectionsMap: new Map([[TEST_ENGINE, mockConnection]]),
+      latestEngineSelected: TEST_ENGINE,
+    });
+
+    const completionSource = completionStore.getCompletionSource(TEST_ENGINE);
+    expect(completionSource?.schema).toMatchInlineSnapshot(`
+      {
+        "test_db": {
+          "children": {
+            "test_schema": {
+              "children": {
+                "dataset2": {
+                  "children": [
+                    {
+                      "info": [Function],
+                      "label": "col1",
+                      "type": "column",
+                    },
+                  ],
+                  "self": {
+                    "info": [Function],
+                    "label": "dataset2",
+                    "type": "table",
+                  },
+                },
+              },
+              "self": {
+                "detail": "test_db.test_schema",
+                "info": [Function],
+                "label": "test_schema",
+                "type": "schema",
+              },
+            },
+          },
+          "self": {
+            "detail": "test_db",
+            "info": [Function],
+            "label": "test_db",
+            "type": "database",
+          },
+        },
+        "test_schema": {
+          "children": {
+            "dataset2": {
+              "children": [
+                {
+                  "info": [Function],
+                  "label": "col1",
+                  "type": "column",
+                },
+              ],
+              "self": {
+                "info": [Function],
+                "label": "dataset2",
+                "type": "table",
+              },
+            },
+          },
+          "self": {
+            "detail": "test_schema",
+            "info": [Function],
+            "label": "test_schema",
+            "type": "schema",
+          },
+        },
+      }
+    `);
+
+    const newConnection: DataSourceConnection = {
+      ...mockConnection,
+      default_schema: "new_schema",
+    };
+
+    mockStore.set(dataSourceConnectionsAtom, {
+      ...mockStore.get(dataSourceConnectionsAtom),
+      connectionsMap: new Map([
+        [TEST_ENGINE, newConnection],
+        // oxlint-disable-next-line typescript/no-explicit-any
+      ]) as any,
+      latestEngineSelected: TEST_ENGINE,
+    });
+
+    const completionSource2 = completionStore.getCompletionSource(TEST_ENGINE);
+    expect(completionSource2?.defaultSchema).toBe("new_schema");
+  });
+
+  it("should return new local tables when local tables are updated", () => {
+    mockStore.set(dataSourceConnectionsAtom, {
+      connectionsMap: new Map([
+        [TEST_ENGINE, mockConnection],
+        // oxlint-disable-next-line typescript/no-explicit-any
+      ]) as any,
+      latestEngineSelected: TEST_ENGINE,
+    });
+    mockStore.set(datasetsAtom, { tables: testDatasets } as DatasetsState);
+    const completionSource = completionStore.getCompletionSource(TEST_ENGINE);
+    expect(completionSource?.schema).toMatchInlineSnapshot(`
+      {
+        "dataset1": {
+          "children": [
+            {
+              "info": [Function],
+              "label": "col1",
+              "type": "column",
+            },
+            {
+              "info": [Function],
+              "label": "col2",
+              "type": "column",
+            },
+          ],
+          "self": {
+            "info": [Function],
+            "label": "dataset1",
+            "type": "table",
+          },
+        },
+        "test_db": {
+          "children": {
+            "test_schema": {
+              "children": {
+                "dataset2": {
+                  "children": [
+                    {
+                      "info": [Function],
+                      "label": "col1",
+                      "type": "column",
+                    },
+                  ],
+                  "self": {
+                    "info": [Function],
+                    "label": "dataset2",
+                    "type": "table",
+                  },
+                },
+              },
+              "self": {
+                "detail": "test_db.test_schema",
+                "info": [Function],
+                "label": "test_schema",
+                "type": "schema",
+              },
+            },
+          },
+          "self": {
+            "detail": "test_db",
+            "info": [Function],
+            "label": "test_db",
+            "type": "database",
+          },
+        },
+        "test_schema": {
+          "children": {
+            "dataset2": {
+              "children": [
+                {
+                  "info": [Function],
+                  "label": "col1",
+                  "type": "column",
+                },
+              ],
+              "self": {
+                "info": [Function],
+                "label": "dataset2",
+                "type": "table",
+              },
+            },
+          },
+          "self": {
+            "detail": "test_schema",
+            "info": [Function],
+            "label": "test_schema",
+            "type": "schema",
+          },
+        },
+      }
+    `);
+
+    const newTestDatasets = [
+      {
+        name: "dataset3",
+        columns: [
+          { name: "col1", type: "number" },
+          { name: "col2", type: "string" },
+        ],
+      },
+    ];
+    mockStore.set(datasetsAtom, { tables: newTestDatasets } as DatasetsState);
+
+    const newCompletionSource =
+      completionStore.getCompletionSource(TEST_ENGINE);
+    expect(newCompletionSource?.schema).toMatchInlineSnapshot(`
+      {
+        "dataset3": {
+          "children": [
+            {
+              "info": [Function],
+              "label": "col1",
+              "type": "column",
+            },
+            {
+              "info": [Function],
+              "label": "col2",
+              "type": "column",
+            },
+          ],
+          "self": {
+            "info": [Function],
+            "label": "dataset3",
+            "type": "table",
+          },
+        },
+        "test_db": {
+          "children": {
+            "test_schema": {
+              "children": {
+                "dataset2": {
+                  "children": [
+                    {
+                      "info": [Function],
+                      "label": "col1",
+                      "type": "column",
+                    },
+                  ],
+                  "self": {
+                    "info": [Function],
+                    "label": "dataset2",
+                    "type": "table",
+                  },
+                },
+              },
+              "self": {
+                "detail": "test_db.test_schema",
+                "info": [Function],
+                "label": "test_schema",
+                "type": "schema",
+              },
+            },
+          },
+          "self": {
+            "detail": "test_db",
+            "info": [Function],
+            "label": "test_db",
+            "type": "database",
+          },
+        },
+        "test_schema": {
+          "children": {
+            "dataset2": {
+              "children": [
+                {
+                  "info": [Function],
+                  "label": "col1",
+                  "type": "column",
+                },
+              ],
+              "self": {
+                "info": [Function],
+                "label": "dataset2",
+                "type": "table",
+              },
+            },
+          },
+          "self": {
+            "detail": "test_schema",
+            "info": [Function],
+            "label": "test_schema",
+            "type": "schema",
+          },
+        },
+      }
+    `);
+  });
+});
+
+const mockConnection: DataSourceConnection = {
+  name: TEST_ENGINE,
+  dialect: "duckdb",
+  display_name: "duckdb",
+  default_database: "test_db",
+  default_schema: "test_schema",
+  source: "duckdb",
+  databases: [
+    {
+      dialect: "duckdb",
+      name: "test_db",
+      schemas: [
+        {
+          name: "test_schema",
+          tables: [
+            {
+              name: "dataset2",
+              source: "duckdb",
+              source_type: "local",
+              type: "table",
+              num_columns: 0,
+              num_rows: 0,
+              variable_name: null,
+              columns: [
+                {
+                  name: "col1",
+                  external_type: "string",
+                  type: "string",
+                  sample_values: [],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
+const testDatasets = [
+  {
+    name: "dataset1",
+    columns: [
+      { name: "col1", type: "number" },
+      { name: "col2", type: "string" },
+    ],
+  },
+];

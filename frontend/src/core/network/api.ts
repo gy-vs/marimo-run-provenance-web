@@ -1,0 +1,218 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+import { createMarimoClient } from "@marimo-team/marimo-api";
+import { HTTPError } from "../../utils/errors";
+import { Logger } from "../../utils/Logger";
+import { Strings } from "../../utils/strings";
+import { getRuntimeManager } from "../runtime/config";
+import type { RuntimeManager } from "../runtime/runtime";
+import type { ExportedFile } from "./types";
+
+function getBaseUriWithoutQueryParams(): string {
+  // Remove query params and hash
+  const url = getRuntimeManager().httpURL;
+  url.search = "";
+  url.hash = "";
+  return url.toString();
+}
+
+function parseContentDispositionFilename(
+  contentDisposition: string | null,
+): string | undefined {
+  if (!contentDisposition) {
+    return undefined;
+  }
+
+  const rfc5987Match = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i);
+  if (rfc5987Match) {
+    try {
+      return decodeURIComponent(rfc5987Match[1]);
+    } catch {
+      return undefined;
+    }
+  }
+
+  const quotedMatch = contentDisposition.match(/filename="([^"]+)"/i);
+  if (quotedMatch) {
+    return quotedMatch[1];
+  }
+
+  const unquotedMatch = contentDisposition.match(/filename=([^;]+)/i);
+  if (unquotedMatch) {
+    return unquotedMatch[1].trim();
+  }
+
+  return undefined;
+}
+
+function getExportFilename(response: Response): string | undefined {
+  const filename = parseContentDispositionFilename(
+    response.headers.get("Content-Disposition"),
+  );
+  if (!filename) {
+    Logger.warn(
+      "Export response is missing a readable Content-Disposition filename",
+    );
+  }
+  return filename;
+}
+
+/**
+ * Wrapper around fetch that adds XSRF token and session ID to the request and
+ * strong types.
+ */
+export const API = {
+  post<REQ, RESP = null>(
+    url: string,
+    body: REQ,
+    opts: {
+      headers?: Record<string, string>;
+      baseUrl?: string;
+      signal?: AbortSignal;
+    } = {},
+  ): Promise<RESP> {
+    const baseUrl = Strings.withTrailingSlash(
+      opts.baseUrl ?? getBaseUriWithoutQueryParams(),
+    );
+    const fullUrl = `${baseUrl}api${url}`;
+    return fetch(fullUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...API.headers(),
+        ...opts.headers,
+      },
+      body: JSON.stringify(body),
+      signal: opts.signal,
+    })
+      .then(async (response) => {
+        const isJson = response.headers
+          .get("Content-Type")
+          ?.startsWith("application/json");
+        if (!response.ok) {
+          const errorBody = isJson
+            ? await response.json()
+            : await response.text();
+          throw new HTTPError(response.status, response.statusText, errorBody);
+        }
+        if (isJson) {
+          return response.json() as RESP;
+        }
+        return response.text() as unknown as RESP;
+      })
+      .catch((error) => {
+        // Catch and rethrow
+        Logger.error(`Error requesting ${fullUrl}`, error);
+        throw error;
+      });
+  },
+  get<RESP = null>(
+    url: string,
+    opts: {
+      headers?: Record<string, string>;
+      baseUrl?: string;
+    } = {},
+  ): Promise<RESP> {
+    const baseUrl = Strings.withTrailingSlash(
+      opts.baseUrl ?? getBaseUriWithoutQueryParams(),
+    );
+    const fullUrl = `${baseUrl}api${url}`;
+    return fetch(fullUrl, {
+      method: "GET",
+      headers: {
+        ...API.headers(),
+        ...opts.headers,
+      },
+    })
+      .then((response) => {
+        if (!response.ok) {
+          throw new HTTPError(response.status, response.statusText);
+        }
+        if (
+          response.headers.get("Content-Type")?.startsWith("application/json")
+        ) {
+          return response.json() as RESP;
+        }
+        return null as RESP;
+      })
+      .catch((error) => {
+        // Catch and rethrow
+        Logger.error(`Error requesting ${fullUrl}`, error);
+        throw error;
+      });
+  },
+  headers() {
+    const runtimeManager = getRuntimeManager();
+    return runtimeManager.headers();
+  },
+  handleResponse: <T>(response: {
+    data?: T | undefined;
+    error?: Record<string, unknown>;
+    response: Response;
+  }): Promise<T> => {
+    if (response.error) {
+      return Promise.reject(
+        new HTTPError(
+          response.response.status,
+          response.response.statusText,
+          response.error,
+        ),
+      );
+    }
+    return Promise.resolve(response.data as T);
+  },
+  handleExportResponse: async <T extends BlobPart>(
+    response: {
+      data?: T | undefined;
+      error?: Record<string, unknown>;
+      response: Response;
+    },
+    opts: { defaultFilename: string },
+  ): Promise<ExportedFile<T>> => {
+    const contents = await API.handleResponse<T>(response);
+    const mediaType = response.response.headers.get("Content-Type");
+    if (!mediaType) {
+      throw new Error("Export response is missing a media type");
+    }
+
+    return {
+      contents,
+      filename: getExportFilename(response.response) ?? opts.defaultFilename,
+      mediaType,
+    };
+  },
+  handleResponseReturnNull: (response: {
+    error?: Record<string, unknown>;
+    response: Response;
+  }): Promise<null> => {
+    if (response.error) {
+      return Promise.reject(
+        new HTTPError(
+          response.response.status,
+          response.response.statusText,
+          response.error,
+        ),
+      );
+    }
+    return Promise.resolve(null);
+  },
+};
+
+export function createClientWithRuntimeManager(runtimeManager: RuntimeManager) {
+  const marimoClient = createMarimoClient({
+    baseUrl: runtimeManager.httpURL.toString(),
+  });
+
+  marimoClient.use({
+    onRequest: (req) => {
+      const headers = runtimeManager.headers();
+
+      for (const [key, value] of Object.entries(headers)) {
+        req.headers.set(key, value);
+      }
+      return req;
+    },
+  });
+
+  return marimoClient;
+}

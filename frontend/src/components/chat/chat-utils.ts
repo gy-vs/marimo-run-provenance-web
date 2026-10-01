@@ -1,0 +1,328 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+import type { components } from "@marimo-team/marimo-api";
+import {
+  type ChatAddToolOutputFunction,
+  type FileUIPart,
+  isToolUIPart,
+  lastAssistantMessageIsCompleteWithApprovalResponses,
+  lastAssistantMessageIsCompleteWithToolCalls,
+  type ToolUIPart,
+  type UIMessage,
+} from "ai";
+import { useRef, useState } from "react";
+import useEvent from "react-use-event-hook";
+import type { ProviderId } from "@/core/ai/ids/ids";
+import type { ToolNotebookContext } from "@/core/ai/tools/base";
+import { FRONTEND_TOOL_REGISTRY } from "@/core/ai/tools/registry";
+import type {
+  InvokeAiToolRequest,
+  InvokeAiToolResponse,
+} from "@/core/network/types";
+import { blobToString } from "@/utils/fileToBase64";
+import { Logger } from "@/utils/Logger";
+import { generateUUID } from "@/utils/uuid";
+import { getAICompletionBodyWithAttachments } from "../editor/ai/completion-utils";
+import { toast } from "../ui/use-toast";
+
+// We need to modify the backend to support attachments for other providers
+// And other types
+export const PROVIDERS_THAT_SUPPORT_ATTACHMENTS = new Set<ProviderId>([
+  "openai",
+  "google",
+  "anthropic",
+]);
+export const SUPPORTED_ATTACHMENT_TYPES = ["image/*", "text/*"];
+const MAX_ATTACHMENT_SIZE = 1024 * 1024 * 50; // 50MB
+
+export function generateChatTitle(message: string): string {
+  return message.length > 50 ? `${message.slice(0, 50)}...` : message;
+}
+
+export async function convertToFileUIPart(
+  files: File[],
+): Promise<FileUIPart[]> {
+  const fileUIParts = await Promise.all(
+    files.map(async (file) => {
+      const part: FileUIPart = {
+        type: "file" as const,
+        mediaType: file.type,
+        filename: file.name,
+        url: await blobToString(file, "dataUrl"),
+      };
+      return part;
+    }),
+  );
+
+  return fileUIParts;
+}
+
+export function isLastMessageReasoning(messages: UIMessage[]): boolean {
+  if (messages.length === 0) {
+    return false;
+  }
+
+  const lastMessage = messages.at(-1);
+  if (!lastMessage) {
+    return false;
+  }
+
+  if (lastMessage.role !== "assistant" || !lastMessage.parts) {
+    return false;
+  }
+
+  const parts = lastMessage.parts;
+  if (parts.length === 0) {
+    return false;
+  }
+
+  // Check if the last part is reasoning
+  const lastPart = parts[parts.length - 1];
+  return lastPart.type === "reasoning";
+}
+
+function stringifyTextParts(parts: UIMessage["parts"]): string {
+  return parts
+    .map((part) => (part.type === "text" ? part.text : ""))
+    .join("\n");
+}
+
+export async function buildCompletionRequestBody(
+  messages: UIMessage[],
+): Promise<{
+  uiMessages: UIMessage[];
+  context?: (null | components["schemas"]["AiCompletionContext"]) | undefined;
+  includeOtherCode: string;
+  selectedText?: string | null | undefined;
+}> {
+  const input = stringifyTextParts(messages.flatMap((m) => m.parts));
+  const completionBody = await getAICompletionBodyWithAttachments({ input });
+
+  // If it's the last message, add the attachments from the completion body
+  function addAttachmentsToMessage(
+    message: UIMessage,
+    isLast: boolean,
+  ): UIMessage {
+    if (!isLast) {
+      return message;
+    }
+    return {
+      ...message,
+      parts: [...message.parts, ...completionBody.attachments],
+    };
+  }
+
+  return {
+    ...completionBody.body,
+    uiMessages: messages.map((m, idx) =>
+      addAttachmentsToMessage(m, idx === messages.length - 1),
+    ),
+  };
+}
+
+export async function handleToolCall({
+  invokeAiTool,
+  addToolOutput, // Important that we don't await addToolOutput to prevent potential deadlocks
+  toolCall,
+  toolContext,
+}: {
+  invokeAiTool: (request: InvokeAiToolRequest) => Promise<InvokeAiToolResponse>;
+  addToolOutput: ChatAddToolOutputFunction<UIMessage>;
+  toolCall: {
+    toolName: string;
+    toolCallId: string;
+    input: Record<string, never>;
+  };
+  toolContext: ToolNotebookContext;
+}) {
+  try {
+    if (FRONTEND_TOOL_REGISTRY.has(toolCall.toolName)) {
+      // Invoke the frontend tool
+      const response = await FRONTEND_TOOL_REGISTRY.invoke({
+        toolName: toolCall.toolName,
+        rawArgs: toolCall.input,
+        toolContext: toolContext,
+      });
+      addToolOutput({
+        tool: toolCall.toolName,
+        toolCallId: toolCall.toolCallId,
+        output: response.result || response.error,
+      });
+    } else {
+      // Invoke the backend/mcp tool
+      const response = await invokeAiTool({
+        toolName: toolCall.toolName,
+        arguments: toolCall.input ?? {}, // Some models pass in null, so we default to an empty object
+      });
+      addToolOutput({
+        tool: toolCall.toolName,
+        toolCallId: toolCall.toolCallId,
+        output: response.result || response.error,
+      });
+    }
+  } catch (error) {
+    Logger.error("Tool call failed:", error);
+    addToolOutput({
+      tool: toolCall.toolName,
+      toolCallId: toolCall.toolCallId,
+      output: `Error: ${error instanceof Error ? error.message : String(error)}`,
+    });
+  }
+}
+
+/**
+ * Auto-send the next turn when the last assistant message ends with a
+ * tool call ready to round-trip. Any non-tool trailing part (text, file,
+ * source-*, reasoning, data-*, new step-start) means the assistant has
+ * already answered, so we leave the next turn to the user. State checks
+ * are delegated to the SDK to stay in sync with upstream.
+ */
+export function hasPendingToolCalls(messages: UIMessage[]): boolean {
+  const lastMessage = messages.at(-1);
+  if (!lastMessage || lastMessage.role !== "assistant") {
+    return false;
+  }
+  const lastPart = lastMessage.parts.at(-1);
+  if (!lastPart || !isToolUIPart(lastPart)) {
+    return false;
+  }
+  return (
+    lastAssistantMessageIsCompleteWithToolCalls({ messages }) ||
+    lastAssistantMessageIsCompleteWithApprovalResponses({ messages }) ||
+    (lastPart.state === "output-denied" && !lastPart.providerExecuted)
+  );
+}
+
+/**
+ * True when the assistant is still waiting on tool execution or user approval.
+ * Unlike `hasPendingToolCalls` (ready to auto-resume), these states must block
+ * releasing queued user messages.
+ */
+export function hasUnresolvedToolCalls(messages: UIMessage[]): boolean {
+  const lastMessage = messages.at(-1);
+  if (!lastMessage || lastMessage.role !== "assistant") {
+    return false;
+  }
+  return lastMessage.parts.some(
+    (part) => isToolUIPart(part) && isUnresolvedToolState(part.state),
+  );
+}
+
+function isUnresolvedToolState(state: ToolUIPart["state"]): boolean {
+  switch (state) {
+    case "approval-requested":
+    case "input-streaming":
+    case "input-available":
+      return true;
+    case "approval-responded":
+    case "output-available":
+    case "output-error":
+    case "output-denied":
+      return false;
+    default: {
+      const _exhaustive: never = state;
+      return _exhaustive;
+    }
+  }
+}
+
+export function useFileState() {
+  const [files, setFiles] = useState<File[]>([]);
+
+  const addFiles = useEvent((newFiles: File[]) => {
+    if (newFiles.length === 0) {
+      return;
+    }
+
+    const totalSize = newFiles.reduce((size, file) => size + file.size, 0);
+    if (totalSize > MAX_ATTACHMENT_SIZE) {
+      toast({
+        title: "File size exceeded",
+        description: "Attachments must be under 50 MB",
+        variant: "danger",
+      });
+      return;
+    }
+
+    setFiles((prev) => [...prev, ...newFiles]);
+  });
+
+  const clearFiles = () => setFiles([]);
+  const removeFile = (fileToRemove: File) =>
+    setFiles((prev) => prev.filter((f) => f !== fileToRemove));
+
+  return { files, addFiles, clearFiles, removeFile };
+}
+
+export type ChatMessagePart = UIMessage["parts"][number];
+
+export interface QueuedUserMessage {
+  id: string;
+  parts: ChatMessagePart[];
+}
+
+/**
+ * Decide whether the message queue should release its next message after a
+ * chat request settles. `onFinish` fires on every completion — including
+ * aborts, errors, and each intermediate tool-call round — so the queue must
+ * only advance once the assistant has genuinely finished its turn.
+ */
+export function shouldFlushQueue(opts: {
+  isError: boolean;
+  isAbort: boolean;
+  hasPendingToolCalls: boolean;
+  hasUnresolvedToolCalls: boolean;
+}): boolean {
+  if (opts.isError) {
+    return false;
+  }
+  // User stopped the stream; release queued input even if a tool part is still
+  // mid-flight (e.g. `input-streaming`).
+  if (opts.isAbort) {
+    return true;
+  }
+  return !opts.hasPendingToolCalls && !opts.hasUnresolvedToolCalls;
+}
+
+/**
+ * Queue of user messages typed while the assistant is still responding.
+ * Messages are enqueued in order and released one at a time.
+ */
+export function useMessageQueue() {
+  const [messages, setMessages] = useState<QueuedUserMessage[]>([]);
+  // Mirror the queue in a ref so `flushNext` reads the latest value even when
+  // invoked from a callback (e.g. `onFinish`) in the same tick as `enqueue`.
+  const messagesRef = useRef<QueuedUserMessage[]>([]);
+  const hasQueuedRef = useRef(false);
+  messagesRef.current = messages;
+  hasQueuedRef.current = messages.length > 0;
+
+  const enqueue = useEvent((parts: ChatMessagePart[]) => {
+    setMessages((prev) => {
+      const next = [...prev, { id: generateUUID(), parts }];
+      messagesRef.current = next;
+      hasQueuedRef.current = true;
+      return next;
+    });
+  });
+
+  const flushNext = useEvent((send: (parts: ChatMessagePart[]) => void) => {
+    const queue = messagesRef.current;
+    if (queue.length === 0) {
+      return;
+    }
+    const [next, ...rest] = queue;
+    messagesRef.current = rest;
+    hasQueuedRef.current = rest.length > 0;
+    setMessages(rest);
+    send(next.parts);
+  });
+
+  const clear = useEvent(() => {
+    messagesRef.current = [];
+    hasQueuedRef.current = false;
+    setMessages([]);
+  });
+
+  return { messages, enqueue, flushNext, clear, hasQueuedRef };
+}

@@ -1,0 +1,134 @@
+@reference "../../../css/globals.css";
+
+.output,
+.media,
+.stdout,
+.stderr,
+.return,
+.marimo-error {
+  width: 100%;
+}
+
+/* No margin in edit mode, where we already have separation
+ * between cells. */
+.marimo-cell.published .output-area .output {
+  margin-top: 1rem;
+  margin-bottom: 1rem;
+}
+
+.marimo-error a {
+  @apply text-link;
+}
+
+.output > * {
+  max-width: 100%;
+}
+
+.output {
+  position: relative;
+
+  /* Unset max-width on .markdown. Instead, we will apply
+  to individual elements so it does not affect UI elements in markdown. */
+  .markdown {
+    max-width: unset;
+  }
+}
+
+.stdout,
+.stderr,
+.marimo-error {
+  font-family: var(--monospace-font);
+}
+
+.stdout,
+.stderr {
+  font-size: 0.813rem;
+}
+
+.stderr {
+  color: var(--amber-12);
+}
+
+.marimo-error {
+  background: #ffc0cb30;
+  padding: 3%;
+  font-size: 0.8125rem;
+  font-weight: bold;
+  border-radius: 20px;
+  white-space: pre-wrap; /* respect newlines */
+
+  @apply text-error;
+}
+
+.marimo-json-output {
+  padding-top: 2px;
+  padding-bottom: 2px;
+  overflow: auto;
+  @apply text-xs;
+
+  .w-rjv-wrap > :not(:last-child) {
+    margin-top: 0.2rem;
+    margin-bottom: 0.2rem;
+  }
+
+  .w-rjv-wrap {
+    padding-left: 0.9rem !important;
+    margin-left: 0.3rem !important;
+  }
+
+  .w-rjv-line > span:first-child,
+  .w-rjv-colon,
+  .w-rjv-inner > span,
+  &.w-rjv-inner > span {
+    opacity: 0.8;
+    letter-spacing: 0.03125rem;
+    line-height: 1.5;
+  }
+
+  .w-rjv-inner > div:last-child:not(.w-rjv-wrap),
+  &.w-rjv-inner > div:last-child:not(.w-rjv-wrap) {
+    line-height: 1.5;
+    padding-left: 0 !important;
+  }
+
+  .w-rjv-line > button:only-child {
+    line-height: 1.5;
+  }
+
+  .w-rjv-arrow {
+    transition: transform 0.3s !important;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .w-rjv-arrow {
+      transition: none !important;
+    }
+  }
+
+  .w-rjv-object-size {
+    padding-left: 4px !important;
+  }
+
+  .copy-button {
+    opacity: 0;
+  }
+
+  .copy-button:focus-visible,
+  .w-rjv-line:hover > .copy-button,
+  .w-rjv-inner:hover > span > .copy-button,
+  /* Root element has both .marimo-json-output and .w-rjv-inner on the same node */
+    &.w-rjv-inner:hover
+    > span
+    > .copy-button {
+    opacity: 1;
+  }
+}
+
+.traceback-cell-link {
+  color: inherit;
+  text-decoration: underline;
+}
+
+.traceback-cell-link:hover {
+  font-weight: 500;
+}
